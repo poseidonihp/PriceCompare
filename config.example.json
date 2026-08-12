@@ -1,0 +1,27 @@
+{
+  "telegram": {
+    "enabled": true,
+    "bot_token": "PON_AQUI_TU_TOKEN_DE_BOTFATHER",
+    "chat_id": "PON_AQUI_TU_CHAT_ID"
+  },
+  "email": {
+    "enabled": true,
+    "smtp_host": "smtp.gmail.com",
+    "smtp_port": 587,
+    "from_addr": "tu_correo@gmail.com",
+    "to_addr": "tu_correo@gmail.com",
+    "app_password": "PON_AQUI_TU_APP_PASSWORD_DE_GMAIL"
+  },
+  "scraper": {
+    "http_timeout_seconds": 15,
+    "playwright_timeout_seconds": 30,
+    "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "cache_html": false,
+    "sanity_min_ratio": 0.25,
+    "sanity_max_ratio": 4.0,
+    "http_retries": 2,
+    "http_backoff_base_seconds": 1.0,
+    "stealth_enabled": true,
+    "max_workers": 4
+  }
+}

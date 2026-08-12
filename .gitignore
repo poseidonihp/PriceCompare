@@ -1,0 +1,33 @@
+# Entornos virtuales
+.venv/
+venv/
+env/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Secretos y datos personales
+config.json
+products.json
+products.json.tmp
+
+# Datos generados en tiempo de corrida
+data/
+reports/
+logs/
+*.log
+
+# Artefactos de herramientas
+.playwright-mcp/
+.claude/settings.local.json
+
+# Editores
+.idea/
+.vscode/
+
+# Sistema operativo
+.DS_Store
+Thumbs.db

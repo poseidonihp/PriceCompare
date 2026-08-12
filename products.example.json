@@ -1,0 +1,49 @@
+[
+  {
+    "id": "tv-ejemplo-55",
+    "name": "TV 55\" OLED 4K (ejemplo)",
+    "url": "https://www.tienda-ejemplo.com/tv-oled-55/p/123456",
+    "selector": null,
+    "target_price": 5690900.0,
+    "currency": "COP",
+    "active": true
+  },
+  {
+    "id": "audifonos-ejemplo",
+    "name": "Audífonos inalámbricos (ejemplo con selector CSS)",
+    "url": "https://www.otra-tienda.com/audifonos-bt/p/987654",
+    "selector": "#js-original_price",
+    "target_price": "-15%",
+    "currency": "COP",
+    "active": true
+  },
+  {
+    "id": "consola-ejemplo",
+    "name": "Consola de videojuegos - Tienda oficial (padre del grupo)",
+    "url": "https://tienda-oficial-ejemplo.com/consola",
+    "selector": null,
+    "target_price": 2199900.0,
+    "currency": "COP",
+    "active": true,
+    "grupo": "consola-ejemplo"
+  },
+  {
+    "id": "consola-ejemplo-retail",
+    "name": "Consola de videojuegos - Retail (mismo grupo)",
+    "url": "https://retail-ejemplo.com/product/consola/456789",
+    "selector": null,
+    "target_price": 2199900.0,
+    "currency": "COP",
+    "active": true,
+    "grupo": "consola-ejemplo"
+  },
+  {
+    "id": "lampara-ejemplo",
+    "name": "Lámpara LED (ejemplo en USD, pausado)",
+    "url": "https://us.tienda-ejemplo.com/products/lampara-led",
+    "selector": null,
+    "target_price": 63.99,
+    "currency": "USD",
+    "active": false
+  }
+]

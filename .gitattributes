@@ -1,0 +1,10 @@
+# Normaliza finales de línea: LF en el repo, nativo en el working tree
+* text=auto
+
+# Los scripts de PowerShell necesitan CRLF en Windows
+*.ps1 text eol=crlf
+
+# Archivos binarios sin conversión
+*.db binary
+*.png binary
+*.jpg binary
