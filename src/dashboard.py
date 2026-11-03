@@ -6,7 +6,8 @@ Luego abrir: http://127.0.0.1:8000
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+from urllib.parse import urlsplit
 
 try:
     from fastapi import FastAPI
@@ -20,9 +21,38 @@ except ImportError:
     )
 
 from .config import DB_PATH, Product, load_products, save_products
+from .extractors import validate_selector
 from .storage import Storage
 
 app = FastAPI(title="priceCompare dashboard", docs_url=None, redoc_url=None)
+stalePriceHours = 48
+
+
+def _valid_product_url(value: str) -> bool:
+    try:
+        parsed = urlsplit(value.strip())
+        return parsed.scheme in ('http', 'https') and bool(parsed.hostname)
+    except ValueError:
+        return False
+
+
+def _capture_details(storage: Storage, product_id: str) -> dict:
+    """Presenta la antigüedad y el último resultado sin atribuir al precio la hora del navegador."""
+    status = storage.capture_status(product_id)
+    stale = False
+    if status.last_success_at:
+        captured = datetime.fromisoformat(status.last_success_at)
+        if captured.tzinfo is None:
+            captured = captured.replace(tzinfo=timezone.utc)
+        stale = datetime.now(timezone.utc) - captured > timedelta(hours=stalePriceHours)
+    return {
+        'last_success_at': status.last_success_at,
+        'last_attempt_at': status.last_attempt_at,
+        'last_status': status.last_status,
+        'last_error': status.last_error,
+        'extraction_method': status.extraction_method,
+        'is_stale': stale,
+    }
 
 
 def _storage() -> Storage:
@@ -79,6 +109,7 @@ def api_products() -> JSONResponse:
                 "grupo": p.grupo,
                 "target_price_relative": p.target_price_relative,
                 "active": p.active,
+                **_capture_details(storage, p.id),
             }
             if sp is None:
                 result.append({
@@ -190,12 +221,13 @@ def api_create_product(payload: ProductCreatePayload) -> JSONResponse:
     pid = payload.id.strip()
     if not pid:
         return JSONResponse({"error": "el id no puede estar vacío"}, status_code=400)
-    if not payload.url.strip().lower().startswith("http"):
+    if not _valid_product_url(payload.url):
         return JSONResponse({"error": "la URL debe empezar con http(s)"}, status_code=400)
     products = load_products()
     if any(p.id == pid for p in products):
         return JSONResponse({"error": f"ya existe un producto con id '{pid}'"}, status_code=409)
     try:
+        validate_selector(payload.selector)
         target = _parsear_target(payload.target_price)
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=400)
@@ -220,13 +252,14 @@ def api_create_product(payload: ProductCreatePayload) -> JSONResponse:
 def api_update_product(product_id: str, payload: ProductUpdatePayload) -> JSONResponse:
     """Edita un producto en products.json y sincroniza la metadata en la BD.
     El id y el initial_price no son editables."""
-    if not payload.url.strip().lower().startswith("http"):
+    if not _valid_product_url(payload.url):
         return JSONResponse({"error": "la URL debe empezar con http(s)"}, status_code=400)
     products = load_products()
     prod = next((p for p in products if p.id == product_id), None)
     if prod is None:
         return JSONResponse({"error": "producto no encontrado"}, status_code=404)
     try:
+        validate_selector(payload.selector)
         target = _parsear_target(payload.target_price)
     except ValueError as exc:
         return JSONResponse({"error": str(exc)}, status_code=400)
@@ -553,10 +586,58 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
 
 <script>
 let allProducts = [];
-let charts = {};
+let charts = Object.create(null);
 let activeFilter = 'all';
 
-const _formatters = {};
+const _formatters = Object.create(null);
+const captureStatusLabels = {success: 'Captura exitosa', error: 'Falló la consulta', rejected: 'Precio rechazado'};
+const chartIds = new Map();
+
+/**
+ * Escapa contenido dinámico antes de insertarlo en HTML o atributos.
+ * @param {unknown} value Contenido recibido.
+ * @returns {string}
+ */
+function escapeHtml(value) {
+  const element = document.createElement('span');
+  element.textContent = String(value ?? '');
+  return element.innerHTML.replaceAll('"', '&quot;').replaceAll("'", '&#39;');
+}
+
+/**
+ * Restringe los enlaces de productos a páginas HTTP o HTTPS.
+ * @param {string} value URL recibida.
+ * @returns {string}
+ */
+function productHref(value) {
+  try {
+    const url = new URL(value);
+    return ['http:', 'https:'].includes(url.protocol) ? escapeHtml(url.href) : '#';
+  } catch {
+    return '#';
+  }
+}
+
+/**
+ * Asigna un identificador único al gráfico sin interpolar datos del producto.
+ * @param {string} productId Identificador del producto.
+ * @returns {string}
+ */
+function chartId(productId) {
+  if (!chartIds.has(productId)) chartIds.set(productId, 'chart-' + chartIds.size);
+  return chartIds.get(productId);
+}
+
+/**
+ * Presenta una fecha de captura en la zona horaria del navegador.
+ * @param {string|null} value Fecha de captura.
+ * @returns {string}
+ */
+function captureDate(value) {
+  if (!value) return 'Sin captura';
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? 'Fecha desconocida' : date.toLocaleString('es-CO');
+}
 function fmt(val, currency) {
   if (val == null) return '—';
   const cur = currency || 'COP';
@@ -567,7 +648,7 @@ function fmt(val, currency) {
         { style: 'currency', currency: cur, maximumFractionDigits: cur === 'COP' ? 0 : 2 }
       );
     } catch (e) {
-      _formatters[cur] = { format: v => cur + ' ' + v.toLocaleString('es-CO') };
+      _formatters[cur] = { format: value => escapeHtml(cur) + ' ' + value.toLocaleString('es-CO') };
     }
   }
   return _formatters[cur].format(val);
@@ -597,6 +678,9 @@ function buildCard(p) {
   if (!p.active) badges += '<span class="badge badge-out">Inactivo</span>';
   if (p.available === false) badges += '<span class="badge badge-out">Sin stock</span>';
   if (p.available === true)  badges += '<span class="badge badge-in">En stock</span>';
+  if (p.is_stale) badges += '<span class="badge badge-out">Precio desactualizado</span>';
+  if (p.last_status === 'error') badges += '<span class="badge badge-out">Falló la consulta</span>';
+  if (p.last_status === 'rejected') badges += '<span class="badge badge-out">Precio rechazado</span>';
   if (isDown) badges += `<span class="badge badge-drop">▼ ${Math.abs(diff)}%</span>`;
   if (isUp)   badges += `<span class="badge badge-up">▲ ${diff}%</span>`;
   if (hitTarget) badges += '<span class="badge badge-hit">✅ Objetivo</span>';
@@ -606,9 +690,14 @@ function buildCard(p) {
   const pctStr = diff !== null ? `${parseFloat(diff) > 0 ? '+' : ''}${diff}%` : '';
 
   let metaRows = '';
+  metaRows += `<span>Última captura: ${escapeHtml(captureDate(p.last_success_at))}</span>`;
+  if (p.last_attempt_at) {
+    metaRows += `<span>Último intento: ${escapeHtml(captureDate(p.last_attempt_at))} · ${escapeHtml(captureStatusLabels[p.last_status] || 'Resultado desconocido')}</span>`;
+  }
+  if (p.last_error) metaRows += `<span>${escapeHtml(p.last_error)}</span>`;
   if (p.min_price != null) {
     const minDate = p.min_price_date ? ' (' + p.min_price_date.slice(0,10) + ')' : '';
-    metaRows += `<span>Mín: ${fmt(p.min_price, p.currency)}${minDate}</span>`;
+    metaRows += `<span>Mín: ${fmt(p.min_price, p.currency)}${escapeHtml(minDate)}</span>`;
   }
   if (p.target_price != null) {
     metaRows += `<span>Objetivo: ${fmt(p.target_price, p.currency)}</span>`;
@@ -622,12 +711,12 @@ function buildCard(p) {
     metaRows += `<span>30d: ${flecha} ${Math.abs(t30)}%</span>`;
   }
 
-  const sparkId = 'chart-' + p.id.replace(/[^a-z0-9]/gi,'_');
+  const sparkId = chartId(p.id);
 
   return `
-  <div class="card ${p.purchased ? 'bought' : ''}" data-id="${p.id}" data-active="${p.active}" data-down="${isDown}" data-target="${hitTarget}" data-out="${p.available===false}" data-bought="${!!p.purchased}">
+  <div class="card ${p.purchased ? 'bought' : ''}" data-id="${escapeHtml(p.id)}" data-active="${!!p.active}" data-down="${isDown}" data-target="${hitTarget}" data-out="${p.available===false}" data-bought="${!!p.purchased}">
     <div class="card-head">
-      <a class="name" href="${p.url}" target="_blank" rel="noopener">${p.name}</a>
+      <a class="name" href="${productHref(p.url)}" target="_blank" rel="noopener">${escapeHtml(p.name)}</a>
       <div class="badges">${badges || '<span class="badge badge-equal">Sin cambio</span>'}</div>
     </div>
     <div class="price-row">
@@ -638,18 +727,18 @@ function buildCard(p) {
     ${metaRows ? `<div class="meta-row">${metaRows}</div>` : ''}
     <div class="chart-wrap"><canvas id="${sparkId}"></canvas></div>
     <div class="card-foot">
-      <a href="${p.url}" target="_blank" rel="noopener">Ver producto →</a>
-      <button class="link-btn" onclick="openHistory('${p.id}')">Histórico</button>
-      <button class="link-btn" style="margin-left:auto" title="Editar" onclick="openForm('${p.id}')">✏️</button>
-      <button class="link-btn" title="${p.active ? 'Pausar monitoreo' : 'Reactivar monitoreo'}" onclick="toggleActive('${p.id}')">${p.active ? '⏸️' : '▶️'}</button>
-      <button class="link-btn" title="Eliminar" onclick="deleteProduct('${p.id}')">🗑️</button>
-      <button class="link-btn" title="${p.purchased ? 'Desmarcar comprado' : 'Marcar comprado'}" onclick="togglePurchased('${p.id}')">${p.purchased ? '↩️' : '🛍️'}</button>
+      <a href="${productHref(p.url)}" target="_blank" rel="noopener">Ver producto →</a>
+      <button class="link-btn" data-action="history">Histórico</button>
+      <button class="link-btn" style="margin-left:auto" title="Editar" data-action="edit">✏️</button>
+      <button class="link-btn" title="${p.active ? 'Pausar monitoreo' : 'Reactivar monitoreo'}" data-action="active">${p.active ? '⏸️' : '▶️'}</button>
+      <button class="link-btn" title="Eliminar" data-action="delete">🗑️</button>
+      <button class="link-btn" title="${p.purchased ? 'Desmarcar comprado' : 'Marcar comprado'}" data-action="purchased">${p.purchased ? '↩️' : '🛍️'}</button>
     </div>
   </div>`;
 }
 
 function renderChart(p) {
-  const sparkId = 'chart-' + p.id.replace(/[^a-z0-9]/gi,'_');
+  const sparkId = chartId(p.id);
   const canvas = document.getElementById(sparkId);
   if (!canvas || !p.history || p.history.length < 2) return;
   if (charts[p.id]) { charts[p.id].destroy(); }
@@ -740,7 +829,10 @@ async function load() {
   document.getElementById('s-target').textContent = target;
   document.getElementById('s-out').textContent = out;
   document.getElementById('s-min').textContent = mins;
-  document.getElementById('last-update').textContent = 'Actualizado ' + new Date().toLocaleTimeString('es-CO');
+  const captures = allProducts.map(product => product.last_success_at).filter(Boolean).sort();
+  document.getElementById('last-update').textContent = captures.length
+    ? 'Captura más reciente: ' + captureDate(captures[captures.length - 1])
+    : 'Sin capturas de precios';
 
   // Ordenar: primero bajadas, luego sin stock, luego el resto
   allProducts.sort((a, b) => {
@@ -770,7 +862,7 @@ async function loadTendencias() {
     if (d.top_bajadas_30d.length) {
       html += '<div class="trend-panel"><h3>📉 Top bajadas del mes</h3><table>' +
         d.top_bajadas_30d.map(x =>
-          `<tr><td><a href="#" onclick="openHistory('${x.id}');return false">${x.name}</a></td>` +
+          `<tr><td><a href="#" data-action="history" data-id="${escapeHtml(x.id)}">${escapeHtml(x.name)}</a></td>` +
           `<td class="price">${fmt(x.last_price, x.currency)}</td>` +
           `<td class="delta down">${x.pct.toFixed(1)}%</td></tr>`).join('') +
         '</table></div>';
@@ -778,7 +870,7 @@ async function loadTendencias() {
     if (d.cerca_del_target.length) {
       html += '<div class="trend-panel"><h3>🎯 Más cerca del objetivo</h3><table>' +
         d.cerca_del_target.map(x =>
-          `<tr><td><a href="#" onclick="openHistory('${x.id}');return false">${x.name}</a></td>` +
+          `<tr><td><a href="#" data-action="history" data-id="${escapeHtml(x.id)}">${escapeHtml(x.name)}</a></td>` +
           `<td class="price">${fmt(x.last_price, x.currency)} / ${fmt(x.target_price, x.currency)}</td>` +
           `<td class="delta up">+${x.pct_sobre_target.toFixed(1)}%</td></tr>`).join('') +
         '</table></div>';
@@ -799,9 +891,9 @@ async function loadHuerfanos() {
     if (!items.length) { cont.style.display = 'none'; return; }
     cont.innerHTML = `<details><summary>🗃️ Huérfanos en la BD (${items.length}) — productos con historial que ya no están en products.json</summary><table>` +
       items.map(h =>
-        `<tr><td>${h.name}</td><td>${h.registros} registro(s)</td>` +
-        `<td>última captura: ${h.ultima_captura || '—'}</td>` +
-        `<td style="text-align:right"><button class="link-btn" onclick="purgarHuerfano('${h.id}')">Purgar</button></td></tr>`).join('') +
+        `<tr><td>${escapeHtml(h.name)}</td><td>${escapeHtml(h.registros)} registro(s)</td>` +
+        `<td>última captura: ${escapeHtml(h.ultima_captura || '—')}</td>` +
+        `<td style="text-align:right"><button class="link-btn" data-action="purge" data-id="${escapeHtml(h.id)}">Purgar</button></td></tr>`).join('') +
       '</table></details>';
     cont.style.display = '';
   } catch (e) {
@@ -974,7 +1066,7 @@ async function openHistory(productId) {
         delta = '<td class="delta">—</td>';
       }
       const date = c.date.slice(0,10).split('-').reverse().join('/');
-      return `<tr><td>${date}</td><td class="price">${fmt(c.price, data.currency)}</td>${delta}</tr>`;
+      return `<tr><td>${escapeHtml(date)}</td><td class="price">${fmt(c.price, data.currency)}</td>${delta}</tr>`;
     }).join('');
     body.innerHTML = `<table>
       <thead><tr><th>Fecha</th><th style="text-align:right">Precio</th><th style="text-align:right">Δ</th></tr></thead>
@@ -991,6 +1083,17 @@ function closeHistory() {
 
 document.addEventListener('keydown', e => {
   if (e.key === 'Escape') { closeHistory(); closeForm(); }
+});
+
+const productActions = {history: openHistory, edit: openForm, active: toggleActive, delete: deleteProduct, purchased: togglePurchased, purge: purgarHuerfano};
+document.addEventListener('click', event => {
+  const control = event.target.closest('[data-action]');
+  if (!control) return;
+  const container = control.closest('[data-id]');
+  const action = productActions[control.dataset.action];
+  if (!container || typeof action !== 'function') return;
+  event.preventDefault();
+  action(container.dataset.id);
 });
 
 load();

@@ -4,6 +4,7 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Literal
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS products (
@@ -30,7 +31,29 @@ CREATE TABLE IF NOT EXISTS price_history (
 
 CREATE INDEX IF NOT EXISTS idx_history_product_date
   ON price_history(product_id, captured_at);
+
+CREATE TABLE IF NOT EXISTS scrape_status (
+  product_id TEXT PRIMARY KEY,
+  last_attempt_at TEXT NOT NULL,
+  last_success_at TEXT,
+  last_status TEXT NOT NULL,
+  last_error TEXT,
+  extraction_method TEXT
+);
 """
+
+CaptureOutcome = Literal['success', 'error', 'rejected']
+
+
+@dataclass(frozen=True)
+class CaptureStatus:
+    """Estado del último intento y fecha de la última captura aceptada."""
+
+    last_attempt_at: str | None
+    last_success_at: str | None
+    last_status: str | None
+    last_error: str | None
+    extraction_method: str | None
 
 
 @dataclass
@@ -67,6 +90,49 @@ class Storage:
 
     def close(self) -> None:
         self.conn.close()
+
+    def record_scrape_result(
+        self, product_id: str, status: CaptureOutcome, error: str | None = None,
+        method: str | None = None,
+    ) -> None:
+        """Registra cada intento sin reemplazar la fecha de éxito cuando falla.
+
+        Args:
+            product_id: Identificador del producto.
+            status: Resultado del intento.
+            error: Motivo seguro.
+            method: Método de extracción.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+        success_at = now if status == 'success' else None
+        self.conn.execute(
+            'INSERT INTO scrape_status '
+            '(product_id, last_attempt_at, last_success_at, last_status, last_error, extraction_method) '
+            'VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(product_id) DO UPDATE SET '
+            'last_attempt_at = excluded.last_attempt_at, '
+            'last_success_at = COALESCE(excluded.last_success_at, scrape_status.last_success_at), '
+            'last_status = excluded.last_status, last_error = excluded.last_error, '
+            'extraction_method = excluded.extraction_method',
+            (product_id, now, success_at, status, error, method),
+        )
+        self.conn.commit()
+
+    def capture_status(self, product_id: str) -> CaptureStatus:
+        """Combina el último intento con el historial existente para bases anteriores.
+
+        Args:
+            product_id: Identificador del producto.
+        Returns:
+            CaptureStatus
+        """
+        row = self.conn.execute('SELECT * FROM scrape_status WHERE product_id = ?', (product_id,)).fetchone()
+        _, historical_capture = self.resumen_historial(product_id)
+        if row is None:
+            return CaptureStatus(historical_capture, historical_capture, 'success' if historical_capture else None, None, None)
+        return CaptureStatus(
+            row['last_attempt_at'], row['last_success_at'] or historical_capture,
+            row['last_status'], row['last_error'], row['extraction_method'],
+        )
 
     def get_product(self, product_id: str) -> StoredProduct | None:
         row = self.conn.execute(
@@ -228,6 +294,7 @@ class Storage:
     def purge_product(self, product_id: str) -> bool:
         """Borra el producto y todo su historial de la BD (huérfanos o eliminación
         con purga explícita). Retorna True si el producto existía."""
+        self.conn.execute('DELETE FROM scrape_status WHERE product_id = ?', (product_id,))
         self.conn.execute("DELETE FROM price_history WHERE product_id = ?", (product_id,))
         cur = self.conn.execute("DELETE FROM products WHERE id = ?", (product_id,))
         self.conn.commit()

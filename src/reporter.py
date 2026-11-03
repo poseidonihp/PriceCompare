@@ -4,7 +4,9 @@ import base64
 import io
 from dataclasses import dataclass, field
 from datetime import date, datetime
+from html import escape
 from pathlib import Path
+from urllib.parse import urlsplit
 
 
 @dataclass
@@ -271,7 +273,7 @@ def _tg_bloque_drop(d: PriceDrop) -> str:
         f"   {_fmt(d.previous_price, d.currency)} → {_fmt(d.current_price, d.currency)} "
         f"({d.delta_vs_previous:+,.2f}, {d.pct_vs_previous:+.1f}%)",
         f"   vs inicial {_fmt(d.initial_price, d.currency)}: "
-        f"ahorras {_fmt(-d.delta_vs_initial, d.currency)} ({-d.pct_vs_initial:.1f}%)",
+        f'diferencia {_fmt(d.delta_vs_initial, d.currency)} ({d.pct_vs_initial:+.1f}%)',
     ]
     if d.is_historical_min:
         lines.append("   🏆 ¡Nuevo mínimo histórico!")
@@ -379,6 +381,21 @@ def build_telegram_message(
 
 # ──────────────────────────────── HTML email ────────────────────────────────
 
+
+def _html_money(value: float, currency: str) -> str:
+    return escape(_fmt(value, currency))
+
+
+def _html_url(value: str) -> str:
+    try:
+        parsed = urlsplit(value)
+        if parsed.scheme in ('http', 'https') and parsed.hostname:
+            return escape(value, quote=True)
+    except ValueError:
+        pass
+    return '#'
+
+
 def _html_badge_vs_padre(s: SitioComparacion, padre_id: str, padre_price: float) -> str:
     if s.product_id == padre_id:
         return "<span style='color:#6b7280;font-size:13px'>referencia</span>"
@@ -397,11 +414,11 @@ def _html_cambio_vs_anterior(s: SitioComparacion) -> str:
         return "<span style='color:#6b7280;font-size:13px'>sin cambio</span>"
     if s.delta < 0:
         return (
-            f"<span style='color:#6b7280;text-decoration:line-through;font-size:12px'>{_fmt(s.previous_price, s.currency)}</span> "
+            f"<span style='color:#6b7280;text-decoration:line-through;font-size:12px'>{_html_money(s.previous_price, s.currency)}</span> "
             f"<span style='background:#dcfce7;color:#15803d;font-weight:700;padding:3px 8px;border-radius:999px;font-size:12px'>▼ {-s.pct:.1f}%</span>"
         )
     return (
-        f"<span style='color:#6b7280;font-size:12px'>{_fmt(s.previous_price, s.currency)} →</span> "
+        f"<span style='color:#6b7280;font-size:12px'>{_html_money(s.previous_price, s.currency)} →</span> "
         f"<span style='color:#b91c1c;font-weight:600;font-size:12px'>+{s.pct:.1f}%</span>"
     )
 
@@ -411,8 +428,8 @@ def _html_fila_sitio_padre(s: SitioComparacion, mejor_id: str, padre_id: str, pa
     padre_mark = " 📍" if s.product_id == padre_id else ""
     return (
         f"<tr><td style='padding:10px 12px;border-bottom:1px solid #e5e7eb'>"
-        f"<a href='{s.url}' style='color:#2563eb;text-decoration:none'>{s.name}{padre_mark}{bandera}</a></td>"
-        f"<td style='padding:10px 12px;border-bottom:1px solid #e5e7eb;text-align:right;font-weight:700'>{_fmt(s.current_price, s.currency)}</td>"
+        f"<a href='{_html_url(s.url)}' style='color:#2563eb;text-decoration:none'>{escape(s.name)}{padre_mark}{bandera}</a></td>"
+        f"<td style='padding:10px 12px;border-bottom:1px solid #e5e7eb;text-align:right;font-weight:700'>{_html_money(s.current_price, s.currency)}</td>"
         f"<td style='padding:10px 12px;border-bottom:1px solid #e5e7eb;text-align:right'>{_html_cambio_vs_anterior(s)}</td>"
         f"<td style='padding:10px 12px;border-bottom:1px solid #e5e7eb;text-align:center'>{_html_badge_vs_padre(s, padre_id, padre_price)}</td></tr>"
     )
@@ -423,8 +440,8 @@ def _html_fila_sitio_simple(s: SitioComparacion, mejor_id: str) -> str:
     delta_str = f"{s.delta:+,.2f} ({s.pct:+.1f}%)" if s.delta is not None else "—"
     return (
         f"<tr><td style='padding:10px 12px;border-bottom:1px solid #e5e7eb'>"
-        f"<a href='{s.url}' style='color:#2563eb;text-decoration:none'>{s.name}</a>{bandera}</td>"
-        f"<td style='padding:10px 12px;border-bottom:1px solid #e5e7eb;text-align:right;font-weight:700'>{_fmt(s.current_price, s.currency)}</td>"
+        f"<a href='{_html_url(s.url)}' style='color:#2563eb;text-decoration:none'>{escape(s.name)}</a>{bandera}</td>"
+        f"<td style='padding:10px 12px;border-bottom:1px solid #e5e7eb;text-align:right;font-weight:700'>{_html_money(s.current_price, s.currency)}</td>"
         f"<td style='padding:10px 12px;border-bottom:1px solid #e5e7eb;text-align:right;color:#6b7280'>{delta_str}</td></tr>"
     )
 
@@ -435,8 +452,8 @@ def _html_tabla_grupo(g: PriceDropGrupo) -> str:
     if g.padre_id is not None and g.padre_current_price is not None:
         padre_sitio = next((s for s in g.sitios if s.product_id == g.padre_id), None)
         padre_name = padre_sitio.name if padre_sitio else g.padre_id
-        titulo = (f"{g.grupo_id} — mejor precio: {_fmt(g.current_min, currency)} "
-                  f"({g.pct_min:+.1f}% vs {padre_name})")
+        titulo = (f"{escape(g.grupo_id)} — mejor precio: {_html_money(g.current_min, currency)} "
+                  f"({g.pct_min:+.1f}% vs {escape(padre_name)})")
         filas = "".join(
             _html_fila_sitio_padre(s, g.mejor_sitio.product_id, g.padre_id, g.padre_current_price)
             for s in sitios_ord
@@ -448,7 +465,7 @@ def _html_tabla_grupo(g: PriceDropGrupo) -> str:
             "<th style='padding:10px 12px;text-align:center;font-size:12px;color:#6b7280;border-bottom:1px solid #e5e7eb'>vs Padre</th>"
         )
     else:
-        titulo = (f"{g.grupo_id} — nuevo mínimo: {_fmt(g.current_min, currency)} "
+        titulo = (f"{escape(g.grupo_id)} — nuevo mínimo: {_html_money(g.current_min, currency)} "
                   f"({g.pct_min:+.1f}%)")
         filas = "".join(_html_fila_sitio_simple(s, g.mejor_sitio.product_id) for s in sitios_ord)
         encabezados = (
@@ -477,9 +494,9 @@ def _html_tabla_restocks(alerts: list[RestockAlert]) -> str:
     filas = "".join(
         f"<tr>"
         f"<td style='padding:14px 16px;border-bottom:1px solid #e5e7eb'>"
-        f"<a href='{a.url}' style='color:#2563eb;font-weight:600;text-decoration:none'>{a.name}</a></td>"
+        f"<a href='{_html_url(a.url)}' style='color:#2563eb;font-weight:600;text-decoration:none'>{escape(a.name)}</a></td>"
         f"<td style='padding:14px 16px;border-bottom:1px solid #e5e7eb;text-align:right;font-weight:700;color:#111827'>"
-        f"{_fmt(a.current_price, a.currency)}</td>"
+        f"{_html_money(a.current_price, a.currency)}</td>"
         f"</tr>"
         for a in alerts
     )
@@ -507,29 +524,29 @@ def _html_resumen(
 
 
 def _html_fila_drop(d: PriceDrop, sparkline_b64: str | None) -> str:
-    pct = -d.pct_vs_initial
+    pct = -d.pct_vs_previous
     target_html = ""
     if d.hit_target:
-        target_html = f"<br><span style='color:#16a34a;font-weight:600'>✅ Objetivo alcanzado ({_fmt(d.target_price, d.currency)})</span>"
+        target_html = f"<br><span style='color:#16a34a;font-weight:600'>✅ Objetivo alcanzado ({_html_money(d.target_price, d.currency)})</span>"
     min_html = ""
     if d.is_historical_min:
         min_html = "<br><span style='color:#d97706;font-weight:600;font-size:12px'>🏆 Nuevo mínimo histórico</span>"
     elif d.min_price is not None:
-        min_html = f"<br><span style='color:#6b7280;font-size:12px'>Mín: {_fmt(d.min_price, d.currency)}</span>"
+        min_html = f"<br><span style='color:#6b7280;font-size:12px'>Mín: {_html_money(d.min_price, d.currency)}</span>"
     spark_html = ""
     if sparkline_b64:
         spark_html = f"<img src='data:image/png;base64,{sparkline_b64}' alt='historial' style='display:block;margin-top:6px;max-width:200px'>"
     return (
         f"<tr>"
         f"<td style='padding:16px;border-bottom:1px solid #e5e7eb'>"
-        f"<a href='{d.url}' style='color:#2563eb;font-weight:600;text-decoration:none'>{d.name}</a>"
+        f"<a href='{_html_url(d.url)}' style='color:#2563eb;font-weight:600;text-decoration:none'>{escape(d.name)}</a>"
         f"{target_html}{min_html}{spark_html}</td>"
-        f"<td style='padding:16px;border-bottom:1px solid #e5e7eb;text-align:right;color:#6b7280'>{_fmt(d.initial_price, d.currency)}</td>"
-        f"<td style='padding:16px;border-bottom:1px solid #e5e7eb;text-align:right;color:#6b7280;text-decoration:line-through'>{_fmt(d.previous_price, d.currency)}</td>"
-        f"<td style='padding:16px;border-bottom:1px solid #e5e7eb;text-align:right;font-weight:700;color:#111827;font-size:16px'>{_fmt(d.current_price, d.currency)}</td>"
+        f"<td style='padding:16px;border-bottom:1px solid #e5e7eb;text-align:right;color:#6b7280'>{_html_money(d.initial_price, d.currency)}</td>"
+        f"<td style='padding:16px;border-bottom:1px solid #e5e7eb;text-align:right;color:#6b7280;text-decoration:line-through'>{_html_money(d.previous_price, d.currency)}</td>"
+        f"<td style='padding:16px;border-bottom:1px solid #e5e7eb;text-align:right;font-weight:700;color:#111827;font-size:16px'>{_html_money(d.current_price, d.currency)}</td>"
         f"<td style='padding:16px;border-bottom:1px solid #e5e7eb;text-align:center'>"
         f"<span style='background:#dcfce7;color:#15803d;font-weight:700;padding:4px 10px;border-radius:999px;font-size:14px'>▼ {pct:.1f}%</span></td>"
-        f"<td style='padding:16px;border-bottom:1px solid #e5e7eb;text-align:right;color:#15803d;font-weight:600'>{_fmt(-d.delta_vs_initial, d.currency)}</td>"
+        f"<td style='padding:16px;border-bottom:1px solid #e5e7eb;text-align:right;font-weight:600'>{_html_money(d.delta_vs_initial, d.currency)}</td>"
         f"</tr>"
     )
 
@@ -559,8 +576,8 @@ def build_html_email(
                   <th style='padding:12px 16px;text-align:right;font-size:12px;color:#6b7280;text-transform:uppercase;letter-spacing:.05em;border-bottom:1px solid #e5e7eb'>Inicial</th>
                   <th style='padding:12px 16px;text-align:right;font-size:12px;color:#6b7280;text-transform:uppercase;letter-spacing:.05em;border-bottom:1px solid #e5e7eb'>Anterior</th>
                   <th style='padding:12px 16px;text-align:right;font-size:12px;color:#6b7280;text-transform:uppercase;letter-spacing:.05em;border-bottom:1px solid #e5e7eb'>Precio actual</th>
-                  <th style='padding:12px 16px;text-align:center;font-size:12px;color:#6b7280;text-transform:uppercase;letter-spacing:.05em;border-bottom:1px solid #e5e7eb'>Bajó</th>
-                  <th style='padding:12px 16px;text-align:right;font-size:12px;color:#6b7280;text-transform:uppercase;letter-spacing:.05em;border-bottom:1px solid #e5e7eb'>Ahorro total</th>
+                  <th style='padding:12px 16px;text-align:center;font-size:12px;color:#6b7280;text-transform:uppercase;letter-spacing:.05em;border-bottom:1px solid #e5e7eb'>Bajó vs anterior</th>
+                  <th style='padding:12px 16px;text-align:right;font-size:12px;color:#6b7280;text-transform:uppercase;letter-spacing:.05em;border-bottom:1px solid #e5e7eb'>Diferencia vs inicial</th>
                 </tr>
               </thead>
               <tbody>{rows}</tbody>

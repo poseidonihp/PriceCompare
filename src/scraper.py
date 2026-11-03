@@ -5,13 +5,14 @@ import hashlib
 import logging
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 from urllib.parse import urlparse
 
 import requests
 
 from .config import Config
-from .extractors import extract_price_and_availability
+from .extractors import ExtractedOffer, extract_offer, validate_selector
 
 logger = logging.getLogger(__name__)
 
@@ -155,60 +156,90 @@ def _try_playwright(
     selector: str | None,
     config: Config,
     headless: bool,
-) -> tuple[float, bool | None, str] | None:
-    """Lanza Playwright con el modo indicado; retorna (precio, disponible, html) o None si no extrae."""
+    expected_currency: str | None = None,
+) -> tuple[ExtractedOffer, str] | None:
+    """Obtiene una oferta del HTML renderizado manteniendo precio, moneda y stock unidos."""
     try:
         html = _fetch_playwright(url, config, headless=headless)
     except Exception as exc:
         raise ScrapeError(f"Playwright falló al cargar {url}: {exc}") from exc
-    price, available = extract_price_and_availability(html, selector)
-    return (price, available, html) if price is not None else None
+    offer = extract_offer(html, selector, url, expected_currency)
+    return (offer, html) if offer.price is not None else None
 
 
-def fetch_price(
+def fetch_offer(
     url: str,
     selector: str | None,
     config: Config,
     cache_dir: Path | None = None,
-) -> tuple[float, bool | None]:
-    """Intenta HTTP simple; si no extrae precio, cae a Playwright headless.
-    Si cache_dir está definido, lee/guarda HTML en disco para iteración rápida.
-    Retorna (precio, disponible) donde disponible es True/False/None."""
+    expected_currency: str | None = None,
+) -> ExtractedOffer:
+    """Consulta una oferta y conserva el método de extracción.
+
+    Args:
+        url: Página del producto.
+        selector: Selector opcional.
+        config: Configuración de transporte.
+        cache_dir: Caché opcional.
+        expected_currency: Moneda configurada.
+    Returns:
+        ExtractedOffer
+    """
+    validate_selector(selector)
 
     if cache_dir is not None:
         cached_html = _load_cache(cache_dir, url)
         if cached_html is not None:
-            price, available = extract_price_and_availability(cached_html, selector)
-            if price is not None:
+            offer = extract_offer(cached_html, selector, url, expected_currency)
+            if offer.price is not None:
                 logger.info("Precio extraído desde caché HTML: %s", url)
-                return price, available
+                return replace(offer, method=f'cache:{offer.method}')
             logger.info("Caché HTML no tiene precio válido, reintentando en red: %s", url)
 
     try:
         html = _fetch_http_con_reintentos(url, config)
-        price, available = extract_price_and_availability(html, selector)
-        if price is not None:
-            logger.info("Precio extraído vía HTTP: %s", price)
+        offer = extract_offer(html, selector, url, expected_currency)
+        if offer.price is not None:
+            logger.info('Scraper > fetch_offer - Precio extraído vía HTTP: %s', offer.price)
             if cache_dir is not None:
                 _save_cache(cache_dir, url, html)
-            return price, available
+            return replace(offer, method=f'http:{offer.method}')
         logger.info("HTTP no extrajo precio, reintentando con Playwright: %s", url)
     except requests.RequestException as exc:
         logger.warning("Fallo HTTP (%s), reintentando con Playwright: %s", exc, url)
 
-    result = _try_playwright(url, selector, config, headless=True)
+    result = _try_playwright(url, selector, config, headless=True, expected_currency=expected_currency)
     if result is not None:
-        price, available, html = result
-        logger.info("Precio extraído vía Playwright headless: %s", price)
+        offer, html = result
+        logger.info('Scraper > fetch_offer - Precio extraído vía Playwright headless: %s', offer.price)
         if cache_dir is not None:
             _save_cache(cache_dir, url, html)
-        return price, available
+        return replace(offer, method=f'playwright_headless:{offer.method}')
 
     logger.info("Playwright headless bloqueado, reintentando sin headless: %s", url)
     with _lock_no_headless:
-        result = _try_playwright(url, selector, config, headless=False)
+        result = _try_playwright(url, selector, config, headless=False, expected_currency=expected_currency)
     if result is None:
         raise ScrapeError(f"No se pudo extraer precio de {url}")
-    price, available, _ = result
-    logger.info("Precio extraído vía Playwright no-headless: %s", price)
-    return price, available
+    offer, _ = result
+    logger.info('Scraper > fetch_offer - Precio extraído vía Playwright no-headless: %s', offer.price)
+    return replace(offer, method=f'playwright_visible:{offer.method}')
+
+
+def fetch_price(
+    url: str, selector: str | None, config: Config, cache_dir: Path | None = None,
+) -> tuple[float, bool | None]:
+    """Conserva la interfaz de consulta existente.
+
+    Args:
+        url: Página del producto.
+        selector: Selector opcional.
+        config: Configuración de transporte.
+        cache_dir: Caché opcional.
+    Returns:
+        tuple[float, bool | None]
+    """
+    offer = fetch_offer(url, selector, config, cache_dir)
+    if offer.price is None:
+        raise ScrapeError('No se pudo extraer un precio válido.')
+    return offer.price, offer.available

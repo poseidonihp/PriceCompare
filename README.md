@@ -11,6 +11,8 @@ Comparador de precios automático. Corre diariamente, revisa las URL de tus prod
 - Si subió o está igual → no hace nada (sin spam).
 - Si un producto vuelve a tener stock (estaba agotado) → notifica aunque el precio no haya cambiado.
 
+Por ejemplo: `100 → 90` notifica, repetir `90` no notifica, `90 → 100` no notifica y `100 → 95` vuelve a notificar. El precio inicial se conserva para calcular la diferencia acumulada; la alerta compara contra la última captura válida.
+
 ## Setup (una sola vez)
 
 ```powershell
@@ -101,6 +103,8 @@ python -m src.dashboard
 
 Luego abrí `http://127.0.0.1:8000`. Muestra todos los productos con gráfico de evolución, badges de estado (bajada, objetivo alcanzado, sin stock, mínimo histórico) y filtros. Requiere `fastapi` y `uvicorn` (incluidos en `requirements.txt`).
 
+Cada tarjeta muestra la última captura exitosa, el último intento y su resultado. Un precio sin captura exitosa durante más de 48 horas aparece como **desactualizado**. Los fallos de consulta y los precios rechazados conservan el último precio aceptado y muestran el motivo. La hora del encabezado corresponde a una captura real.
+
 ### Consultar mínimo histórico de un producto
 
 ```powershell
@@ -174,11 +178,13 @@ priceCompare/
 Cascada de estrategias, en orden:
 
 1. **CSS selector custom** (si lo definiste en `products.json`).
-2. **JSON-LD** — busca `<script type="application/ld+json">` con `Product.offers.price`.
+2. **JSON-LD** — identifica el producto principal y selecciona una oferta con su precio, moneda y disponibilidad; prioriza ofertas disponibles de la moneda configurada.
 3. **Meta tags** — `og:price:amount`, `product:price:amount`, `itemprop="price"`.
-4. **Regex** — busca números tipo precio cerca de palabras como "precio", "price", "total".
+4. **Regex** — busca un importe inequívoco etiquetado como precio en el contenido principal, descartando cuotas y recomendaciones.
 
 Si HTTP simple no funciona (sitio con JavaScript), reintenta con **Playwright headless** y repite las 4 estrategias sobre el HTML renderizado.
+
+Los precios ambiguos, no positivos o no finitos se descartan, incluso en la primera captura. Un selector CSS inválido se rechaza al guardar; si ya existe en el catálogo, solo falla ese producto. Las ofertas agotadas se guardan en el historial, pero no participan en la selección de la mejor oferta de un grupo. Los grupos tampoco repiten alertas por precios sin cambios.
 
 ## Notas
 
@@ -186,6 +192,14 @@ Si HTTP simple no funciona (sitio con JavaScript), reintenta con **Playwright he
 - Si un sitio cambia su HTML y deja de funcionar la extracción, vas a ver errores en `logs/run.log`. Solución típica: abrir la página, inspeccionar el precio, y poner un CSS selector en el campo `selector` de ese producto. Podés usar `--cache-html` para iterar los selectores sin re-scrapear.
 - Si el precio extraído es menor al 25% o mayor al 400% del precio inicial, se descarta automáticamente como extracción rota (configurable con `sanity_min_ratio` y `sanity_max_ratio` en `config.json`).
 - SQLite (`data/prices.db`) se puede abrir con [DB Browser for SQLite](https://sqlitebrowser.org/) para ver el historial completo.
+
+## Verificación
+
+```powershell
+.venv\Scripts\python.exe -X utf8 -B -m unittest discover -s tests -v
+```
+
+Las pruebas usan bases temporales, HTML de ejemplo y respuestas simuladas. No consultan tiendas ni envían notificaciones. Las pruebas del dashboard requieren Chromium instalado mediante `playwright install chromium`. La tabla `scrape_status` se crea automáticamente al abrir una base existente, sin modificar sus precios iniciales ni su historial.
 
 ## Licencia
 

@@ -12,6 +12,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.config import Product, load_products, save_products
+from src.extractors import ExtractionError, validate_selector
 
 
 def main() -> int:
@@ -24,6 +25,12 @@ def main() -> int:
     parser.add_argument("--currency", default="USD", help="Moneda (USD, COP, etc.)")
     parser.add_argument("--grupo", default=None, help="ID de grupo para comparar el mismo producto en varios sitios")
     args = parser.parse_args()
+
+    try:
+        validate_selector(args.selector)
+    except ExtractionError as error:
+        print(str(error))
+        return 1
 
     products = load_products()
     if any(p.id == args.id for p in products):

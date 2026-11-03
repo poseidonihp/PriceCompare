@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import io
 import logging
+import math
 import sys
 import threading
 import time
@@ -32,10 +33,15 @@ from .reporter import (
     build_telegram_message,
     save_report,
 )
-from .scraper import RedirectError, ScrapeError, fetch_price
-from .storage import Storage
+from .extractors import ExtractedOffer, ExtractionError
+from .scraper import RedirectError, ScrapeError, fetch_offer
+from .storage import Storage, StoredProduct
 
 logger = logging.getLogger("priceCompare")
+
+
+class RejectedPriceError(ValueError):
+    """Precio descartado antes de modificar el historial."""
 
 
 _LEVEL_ICONS = {
@@ -192,28 +198,10 @@ def _build_drop(
     effective_target: float | None,
     min_info: tuple[float, str] | None,
 ) -> PriceDrop | None:
-    """Decide si hay bajada. Única referencia: el precio INICIAL.
-
-    Solo se alerta cuando el precio de hoy está estrictamente por debajo del
-    inicial. La igualdad o la subida vs. el inicial son silencio total. El
-    `effective_target` NO dispara por sí solo (los movimientos respecto al
-    precio anterior no cuentan): queda solo como bandera 'objetivo alcanzado'
-    cuando ya existe una bajada real vs. el inicial.
-    """
-    if current_price >= initial_price:
-        if current_price > initial_price:
-            logger.info(
-                "Precio por encima del inicial para %s: inicial=%.2f, hoy=%.2f (+%.1f%%) — sin alerta",
-                product.id, initial_price, current_price,
-                ((current_price - initial_price) / initial_price) * 100,
-            )
-        else:
-            logger.info(
-                "Precio igual al inicial para %s: inicial=%.2f, hoy=%.2f — sin alerta",
-                product.id, initial_price, current_price,
-            )
+    """Alerta únicamente al bajar respecto al último precio válido; conserva el inicial para calcular ahorro."""
+    if current_price >= previous_price:
         return None
-    logger.info("Bajada detectada para %s: inicial %.2f → hoy %.2f", product.id, initial_price, current_price)
+    logger.info('Main > _build_drop - Bajada para %s: anterior %.2f → hoy %.2f', product.id, previous_price, current_price)
     return PriceDrop(
         product_id=product.id, name=product.name, url=product.url, currency=product.currency,
         initial_price=initial_price, previous_price=previous_price, current_price=current_price,
@@ -223,6 +211,38 @@ def _build_drop(
     )
 
 
+def _validate_captured_price(
+    product: Product, current_price: float, extracted_currency: str | None,
+    stored: StoredProduct | None, config: Config,
+) -> None:
+    """Comprueba importe, moneda y límites antes de registrar cualquier captura."""
+    if not math.isfinite(current_price) or current_price <= 0:
+        raise RejectedPriceError('El precio debe ser positivo y finito.')
+    if extracted_currency and extracted_currency.upper() != product.currency.upper():
+        raise RejectedPriceError('La moneda extraída no coincide con la configurada.')
+    if stored is not None and not _sanity_check(product.id, current_price, stored.initial_price, config):
+        raise RejectedPriceError(
+            f'Precio sospechoso: {current_price:,.2f}; referencia {stored.initial_price:,.2f}. '
+            f'Rango permitido: {stored.initial_price * config.scraper.sanity_min_ratio:,.2f}'
+            f' a {stored.initial_price * config.scraper.sanity_max_ratio:,.2f}.'
+        )
+
+
+def _register_first_capture(
+    product: Product, price: float, available: bool | None, storage: Storage, dry_run: bool,
+) -> None:
+    """Registra el precio inicial y su primera observación sin generar alertas."""
+    logger.info('Main > _register_first_capture - Nuevo producto %s: %.2f', product.id, price)
+    if dry_run:
+        return
+    storage.register_new_product(
+        product_id=product.id, name=product.name, url=product.url,
+        initial_price=price, currency=product.currency,
+        target_price=_effective_target(product, price),
+    )
+    storage.append_price(product.id, price, available)
+
+
 def _process_product(
     product: Product,
     current_price: float,
@@ -230,31 +250,20 @@ def _process_product(
     storage: Storage,
     config: Config,
     dry_run: bool,
+    extracted_currency: str | None = None,
 ) -> tuple[PriceDrop | None, RestockAlert | None, float | None, float | None]:
-    """Compara el precio ya extraído contra el historial y decide drop/restock.
-    Corre en el hilo principal (SQLite y decisiones); el fetch ocurre en _scrape_all.
-    Retorna (drop_o_None, restock_o_None, previous_price, current_price)."""
-    _log_availability(available, product.name)
-
+    """Compara una captura validada con el historial y excluye ofertas agotadas de los grupos."""
     stored = storage.get_product(product.id)
+    _validate_captured_price(product, current_price, extracted_currency, stored, config)
+    _log_availability(available, product.name)
     if stored is not None and stored.purchased:
         logger.info("🛍️  %s marcado como comprado — omitiendo notificaciones", product.name)
         if not dry_run:
             storage.append_price(product.id, current_price, available)
         return None, None, None, None
     if stored is None:
-        logger.info("🆕 Nuevo producto registrado: %s → %s %s", product.name, f"{current_price:,.0f}", product.currency)
-        if not dry_run:
-            storage.register_new_product(
-                product_id=product.id, name=product.name, url=product.url,
-                initial_price=current_price, currency=product.currency,
-                target_price=_effective_target(product, current_price),
-            )
-            storage.append_price(product.id, current_price, available)
-        return None, None, None, current_price
-
-    if not _sanity_check(product.id, current_price, stored.initial_price, config):
-        return None, None, None, None
+        _register_first_capture(product, current_price, available, storage, dry_run)
+        return None, None, None, current_price if available is not False else None
 
     previous_price = storage.last_price(product.id)
     last_available = storage.last_availability(product.id)
@@ -264,7 +273,7 @@ def _process_product(
 
     if available is False:
         logger.info("Sin stock para %s — omitiendo comparación de precios", product.id)
-        return None, None, previous_price, current_price
+        return None, None, previous_price, None
 
     restock = _detect_restock(available, last_available, product, current_price)
 
@@ -290,6 +299,10 @@ def _proceso_grupo_con_padre(
     current_min = mejor_sitio.current_price
     alguien_mas_barato = current_min < padre_curr
     padre_bajo = padre_prev is not None and padre_curr < padre_prev
+
+    changed = any(site.previous_price is not None and site.current_price < site.previous_price for site in sitios)
+    if not changed:
+        return None
 
     if not alguien_mas_barato and not padre_bajo:
         logger.info("Grupo %s: padre '%s' (%.2f) sigue siendo el más barato y no bajó",
@@ -322,13 +335,9 @@ def _proceso_grupo_sin_padre(
 
     current_min = mejor_sitio.current_price
     previous_min = min(s.previous_price for s in sitios_con_prev)  # type: ignore[arg-type]
-    sitios_nuevos = [s for s in sitios if s.previous_price is None]
-
-    if sitios_nuevos:
-        logger.info("Nuevo sitio en grupo %s (%s), mínimo actual=%.2f (mejor: %s)",
-                    grupo_id, ", ".join(s.name for s in sitios_nuevos), current_min, mejor_sitio.name)
-        return PriceDropGrupo(grupo_id=grupo_id, sitios=sitios, previous_min=previous_min,
-                              current_min=current_min, mejor_sitio=mejor_sitio)
+    changed = any(site.previous_price is not None and site.current_price < site.previous_price for site in sitios)
+    if not changed:
+        return None
 
     if current_min >= previous_min:
         logger.info("Grupo %s sin nuevo mínimo: anterior=%.2f, hoy=%.2f", grupo_id, previous_min, current_min)
@@ -358,12 +367,80 @@ def _process_grupo(
     if len(sitios) < 2:
         return None
 
+    if len({site.currency.upper() for site in sitios}) > 1:
+        logger.warning('Main > _process_grupo - Monedas incompatibles en grupo %s', grupo_id)
+        return None
+
     mejor_sitio = min(sitios, key=lambda s: s.current_price)
     padre_sitio = next((s for s in sitios if s.product_id == grupo_id), None)
 
     if padre_sitio is not None:
         return _proceso_grupo_con_padre(grupo_id, sitios, padre_sitio, mejor_sitio)
     return _proceso_grupo_sin_padre(grupo_id, sitios, mejor_sitio)
+
+
+def _scrape_error_reason(error: Exception) -> str:
+    """Clasifica fallos sin guardar respuestas, URLs ni datos sensibles del transporte."""
+    if isinstance(error, ExtractionError):
+        return 'Selector CSS inválido.'
+    if isinstance(error, RedirectError):
+        return 'La página redirigió a otro dominio.'
+    if isinstance(error, ScrapeError):
+        return 'No se pudo cargar la página o extraer un precio válido.'
+    return f'Error de extracción ({type(error).__name__}).'
+
+
+def _accept_offer(
+    product: Product, offer: ExtractedOffer, storage: Storage, config: Config, dry_run: bool,
+) -> tuple[PriceDrop | None, RestockAlert | None, float | None, float | None, bool]:
+    """Valida una oferta y registra su aceptación o rechazo sin detener otros productos."""
+    try:
+        if offer.price is None:
+            raise RejectedPriceError('No se extrajo un precio válido.')
+        result = _process_product(product, offer.price, offer.available, storage, config, dry_run, offer.currency)
+    except RejectedPriceError as error:
+        logger.warning('Main > _accept_offer - Precio rechazado para %s: %s', product.id, error)
+        if not dry_run:
+            storage.record_scrape_result(product.id, 'rejected', str(error), offer.method)
+        return None, None, None, None, True
+    if not dry_run:
+        storage.record_scrape_result(product.id, 'success', method=offer.method)
+    return (*result, False)
+
+
+def _process_scrape_result(
+    product: Product, result: tuple[ExtractedOffer | None, str | None, list[logging.LogRecord], float],
+    storage: Storage, config: Config, dry_run: bool,
+) -> tuple[PriceDrop | None, RestockAlert | None, float | None, float | None, bool]:
+    """Procesa un resultado de red y registra fallos antes de continuar con el siguiente producto."""
+    offer, error, records, duration = result
+    logger.info('Main > _process_scrape_result - Consultado %s (%.1fs)', product.name, duration)
+    for record in records:
+        logging.getLogger(record.name).handle(record)
+    if error is not None:
+        logger.error('Main > _process_scrape_result - Scrape falló para %s: %s', product.id, error)
+        if not dry_run:
+            storage.record_scrape_result(product.id, 'error', error)
+        return None, None, None, None, True
+    return _accept_offer(product, offer or ExtractedOffer(), storage, config, dry_run)
+
+
+def _build_group_alerts(
+    products: list[Product], price_results: dict[str, tuple[float | None, float | None]], drops: list[PriceDrop],
+) -> tuple[list[PriceDrop], list[PriceDropGrupo]]:
+    """Construye comparaciones y evita duplicar productos ya incluidos en una alerta de grupo."""
+    groups: dict[str, list[Product]] = {}
+    for product in products:
+        if product.grupo:
+            groups.setdefault(product.grupo, []).append(product)
+    group_drops = [
+        drop for group_id, members in groups.items()
+        if (drop := _process_grupo(group_id, members, price_results)) is not None
+    ]
+    reported_groups = {drop.grupo_id for drop in group_drops}
+    product_groups = {product.id: product.grupo for product in products}
+    individual_drops = [drop for drop in drops if product_groups.get(drop.product_id) not in reported_groups]
+    return individual_drops, group_drops
 
 
 def _scrape_all(
@@ -395,18 +472,17 @@ def _scrape_all(
 
     def _fetch_con_captura(
         product: Product,
-    ) -> tuple[float | None, bool | None, ScrapeError | None, list[logging.LogRecord], float]:
-        """Corre en un worker: hace el fetch capturando sus logs.
-        Retorna (precio, disponible, error_o_None, logs_capturados, duración_seg)."""
+    ) -> tuple[ExtractedOffer | None, str | None, list[logging.LogRecord], float]:
+        """Aísla errores del scraping y captura los logs del producto."""
         buffer: list[logging.LogRecord] = []
         captura.registrar_hilo(buffer)
         inicio = time.monotonic()
         try:
             try:
-                price, available = fetch_price(product.url, product.selector, config, cache_dir)
-                return price, available, None, buffer, time.monotonic() - inicio
-            except ScrapeError as exc:  # incluye RedirectError
-                return None, None, exc, buffer, time.monotonic() - inicio
+                offer = fetch_offer(product.url, product.selector, config, cache_dir, product.currency)
+                return offer, None, buffer, time.monotonic() - inicio
+            except Exception as exc:
+                return None, _scrape_error_reason(exc), buffer, time.monotonic() - inicio
         finally:
             captura.liberar_hilo()
 
@@ -414,21 +490,10 @@ def _scrape_all(
         with ThreadPoolExecutor(max_workers=workers) as pool:
             futuros = {p.id: pool.submit(_fetch_con_captura, p) for p in products}
             for product in products:
-                current_price, available, error, buffer, duracion = futuros[product.id].result()
-                logger.info("🔎 Consultando: %s (%.1fs)", product.name, duracion)
-                for record in buffer:
-                    logging.getLogger(record.name).handle(record)
-                if error is not None:
-                    if isinstance(error, RedirectError):
-                        logger.error("URL redirige a otro sitio para %s: %s", product.id, error)
-                    else:
-                        logger.error("Scrape falló para %s: %s", product.id, error)
-                    had_errors = True
-                    price_results[product.id] = (None, None)
-                    continue
-                drop, restock, prev, curr = _process_product(
-                    product, current_price, available, storage, config, dry_run
+                drop, restock, prev, curr, rejected = _process_scrape_result(
+                    product, futuros[product.id].result(), storage, config, dry_run
                 )
+                had_errors = had_errors or rejected
                 if drop is not None:
                     drops.append(drop)
                 if restock is not None:
@@ -439,23 +504,7 @@ def _scrape_all(
         for h in handlers_salida:
             h.removeFilter(silenciador)
 
-    grupos: dict[str, list[Product]] = {}
-    for p in products:
-        if p.grupo:
-            grupos.setdefault(p.grupo, []).append(p)
-
-    grupo_drops: list[PriceDropGrupo] = [
-        gdrop
-        for grupo_id, grupo_products in grupos.items()
-        if (gdrop := _process_grupo(grupo_id, grupo_products, price_results)) is not None
-    ]
-
-    # Evitar duplicación: si un producto ya aparece en un grupo multi-sitio reportado,
-    # omitirlo de la sección de bajadas individuales.
-    grupos_reportados = {g.grupo_id for g in grupo_drops}
-    product_grupo = {p.id: p.grupo for p in products}
-    drops = [d for d in drops if product_grupo.get(d.product_id) not in grupos_reportados]
-
+    drops, grupo_drops = _build_group_alerts(products, price_results, drops)
     return drops, grupo_drops, restocks, had_errors
 
 

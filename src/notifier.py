@@ -24,7 +24,11 @@ def send_telegram(message: str, config: TelegramConfig) -> bool:
         response = requests.post(url, json=payload, timeout=15)
         response.raise_for_status()
     except requests.RequestException as exc:
-        logger.error("Error enviando Telegram: %s", exc)
+        status = exc.response.status_code if exc.response is not None else None
+        logger.error(
+            'Notifier > send_telegram - Falló el envío: tipo=%s, estado_http=%s',
+            type(exc).__name__, status,
+        )
         return False
     return True
 
