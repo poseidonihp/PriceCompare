@@ -26,6 +26,8 @@ class Product:
     grupo: str | None = None
     # Objetivo relativo: ej. "-20%" → 20% por debajo del initial_price
     target_price_relative: str | None = None
+    # Talla JSON-LD a seguir cuando la URL publica un Product por talla
+    variant: str | None = None
 
     @classmethod
     def from_dict(cls, raw: dict) -> "Product":
@@ -46,6 +48,7 @@ class Product:
             currency=raw.get("currency", "USD"),
             active=raw.get("active", True),
             grupo=raw.get("grupo"),
+            variant=raw.get("variant"),
         )
 
 
@@ -140,6 +143,8 @@ def save_products(products: list[Product]) -> None:
         }
         if p.grupo is not None:
             d["grupo"] = p.grupo
+        if p.variant is not None:
+            d["variant"] = p.variant
         return d
 
     data = [_product_dict(p) for p in products]

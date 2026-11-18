@@ -1,6 +1,8 @@
 Agrega un nuevo producto al comparador de precios ejecutando `scripts/add_product.py`.
 
-Argumentos: `<id> "<nombre>" "<url>" [--selector CSS] [--target PRECIO] [--currency MONEDA] [--grupo ID_GRUPO]`
+Argumentos: `<id> "<nombre>" "<url>" [--selector CSS] [--target PRECIO] [--currency MONEDA] [--grupo ID_GRUPO] [--variant "TALLA"]`
+
+`--variant` elige la talla cuando la URL publica varias en JSON-LD (ej. `--variant "240 x 220 cm"`).
 
 Ejemplos:
 - `/agregar-producto tv-lg-55 "LG 55 OLED" "https://tienda.com/tv" --target 4000000 --currency COP`

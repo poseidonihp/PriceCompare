@@ -132,6 +132,22 @@ class ExtractionTests(unittest.TestCase):
         html = '<meta id="chosen" content="1200">' + _schema_html({'@type': 'Product', 'offers': {'price': 1500}})
         self.assertEqual(extract_offer(html, '#chosen').price, 1200)
 
+    def test_variant_selects_size_among_products(self) -> None:
+        html = _schema_html([
+            {'@type': 'Product', 'size': '135 x 200 cm', 'offers': {'price': '839000.00', 'availability': 'InStock'}},
+            {'@type': 'Product', 'size': '240 x 220 cm', 'offers': {'price': '1299000.00', 'availability': 'OutOfStock'}},
+            {'@type': 'Product', 'size': '240 x 220 cm', 'offers': {'price': '1399000.00', 'availability': 'InStock'}},
+        ])
+        self.assertIsNone(extract_offer(html).price)
+        offer = extract_offer(html, variant='240 X 220  cm')
+        self.assertEqual((offer.price, offer.available, offer.method), (1399000, True, 'json_ld'))
+
+    def test_missing_variant_does_not_fall_back_to_page_price(self) -> None:
+        html = '<meta itemprop="price" content="839000">' + _schema_html(
+            {'@type': 'Product', 'size': '135 x 200 cm', 'offers': {'price': 839000}},
+        )
+        self.assertIsNone(extract_offer(html, variant='240 x 220 cm').price)
+
     def test_invalid_selector_is_rejected_before_network(self) -> None:
         with patch('src.scraper._fetch_http_con_reintentos') as fetch:
             with self.assertRaises(ExtractionError):
@@ -216,6 +232,20 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(self._storage.last_price(product.id), 90)
         self.assertTrue(main._accept_offer(product, ExtractedOffer(1), self._storage, self._config, False)[-1])
 
+    def test_purchased_products_are_not_consulted(self) -> None:
+        bought, other = _product('bought'), _product('other')
+        for product in (bought, other):
+            main._process_product(product, 100, True, self._storage, self._config, False)
+        self._storage.set_purchased(bought.id, True)
+        offer = ExtractedOffer(90, True, 'COP', 'http:meta')
+        with patch('src.main.fetch_offer', return_value=offer) as fetch:
+            main._scrape_all([bought, other], self._storage, self._config, None, False)
+        self.assertEqual(fetch.call_count, 1)
+        self.assertEqual(len(self._storage.price_history(bought.id)), 1)
+        attempt = self._storage.conn.execute('SELECT 1 FROM scrape_status WHERE product_id = ?', (bought.id,))
+        self.assertIsNone(attempt.fetchone())
+        self.assertEqual(self._storage.last_price(other.id), 90)
+
     def test_invalid_selector_does_not_abort_other_products(self) -> None:
         products = [_product('bad', selector='['), _product('good')]
         with patch('src.scraper._fetch_http_con_reintentos', return_value='<meta itemprop="price" content="100">'):
@@ -239,6 +269,19 @@ class PipelineTests(unittest.TestCase):
             with patch('sys.argv', args), patch('builtins.print'):
                 self.assertEqual(add_product(), 1)
             self.assertFalse((self._root / 'products.json').exists())
+
+    def test_variant_survives_cli_and_dashboard_edit(self) -> None:
+        from scripts.add_product import main as add_product
+
+        catalog = self._root / 'products.json'
+        catalog.write_text('[]', encoding='utf-8')
+        with patch('src.config.PRODUCTS_PATH', catalog), patch('src.dashboard.DB_PATH', self._root / 'prices.db'):
+            args = ['add_product.py', 'sample', 'Sample', 'https://example.test/product', '--variant', '240 x 220 cm']
+            with patch('sys.argv', args), patch('builtins.print'):
+                self.assertEqual(add_product(), 0)
+            update = dashboard.ProductUpdatePayload(name='Updated', url='https://example.test/product')
+            self.assertEqual(dashboard.api_update_product('sample', update).status_code, 200)
+        self.assertEqual(json.loads(catalog.read_text(encoding='utf-8'))[0]['variant'], '240 x 220 cm')
 
     def test_legacy_database_keeps_prices_and_gets_attempt_table(self) -> None:
         main._process_product(_product(), 100, True, self._storage, self._config, False)
@@ -265,6 +308,20 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(result['last_success_at'], old_capture)
         self.assertEqual(result['last_status'], 'error')
         self.assertIsNotNone(result['last_attempt_at'])
+
+    def test_dashboard_purchased_product_is_not_stale(self) -> None:
+        product = _product()
+        main._process_product(product, 100, True, self._storage, self._config, False)
+        self._storage.conn.execute('UPDATE price_history SET captured_at = ?', ('2020-01-01T00:00:00+00:00',))
+        self._storage.conn.commit()
+        self._storage.set_purchased(product.id, True)
+        with (
+            patch('src.dashboard.load_products', return_value=[product]),
+            patch('src.dashboard.DB_PATH', self._root / 'prices.db'),
+        ):
+            current = json.loads(dashboard.api_products().body)[0]
+        self.assertTrue(current['purchased'])
+        self.assertFalse(current['is_stale'])
 
     def test_dashboard_validates_selector_and_url_without_saving(self) -> None:
         with patch('src.dashboard.load_products', return_value=[]), patch('src.dashboard.save_products') as save:

@@ -38,6 +38,16 @@
     "grupo": "consola-ejemplo"
   },
   {
+    "id": "relleno-ejemplo",
+    "name": "Relleno nórdico (ejemplo con varias tallas en la misma URL)",
+    "url": "https://www.tienda-ejemplo.com/relleno-nordico-plumon",
+    "selector": null,
+    "target_price": 1400000.0,
+    "currency": "COP",
+    "active": true,
+    "variant": "240 x 220 cm"
+  },
+  {
     "id": "lampara-ejemplo",
     "name": "Lámpara LED (ejemplo en USD, pausado)",
     "url": "https://us.tienda-ejemplo.com/products/lampara-led",

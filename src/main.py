@@ -443,6 +443,15 @@ def _build_group_alerts(
     return individual_drops, group_drops
 
 
+def _skip_purchased(products: list[Product], storage: Storage) -> list[Product]:
+    """Excluye los productos marcados como comprados para que no se consulten."""
+    purchased_ids = {stored.id for stored in storage.all_products() if stored.purchased}
+    for product in products:
+        if product.id in purchased_ids:
+            logger.info('Main > _skip_purchased - %s marcado como comprado; no se consulta', product.name)
+    return [product for product in products if product.id not in purchased_ids]
+
+
 def _scrape_all(
     products: list[Product],
     storage: Storage,
@@ -450,6 +459,7 @@ def _scrape_all(
     cache_dir: Path | None,
     dry_run: bool,
 ) -> tuple[list[PriceDrop], list[PriceDropGrupo], list[RestockAlert], bool]:
+    products = _skip_purchased(products, storage)
     drops: list[PriceDrop] = []
     restocks: list[RestockAlert] = []
     price_results: dict[str, tuple[float | None, float | None]] = {}
@@ -479,7 +489,7 @@ def _scrape_all(
         inicio = time.monotonic()
         try:
             try:
-                offer = fetch_offer(product.url, product.selector, config, cache_dir, product.currency)
+                offer = fetch_offer(product.url, product.selector, config, cache_dir, product.currency, product.variant)
                 return offer, None, buffer, time.monotonic() - inicio
             except Exception as exc:
                 return None, _scrape_error_reason(exc), buffer, time.monotonic() - inicio

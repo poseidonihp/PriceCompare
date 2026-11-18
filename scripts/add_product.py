@@ -2,6 +2,7 @@
 
 Uso:
   python scripts/add_product.py <id> <nombre> <url> [--selector CSS] [--target 800] [--currency USD] [--grupo ID_GRUPO]
+                                [--variant "240 x 220 cm"]
 """
 from __future__ import annotations
 
@@ -24,6 +25,7 @@ def main() -> int:
     parser.add_argument("--target", type=float, default=None, help="Precio objetivo opcional")
     parser.add_argument("--currency", default="USD", help="Moneda (USD, COP, etc.)")
     parser.add_argument("--grupo", default=None, help="ID de grupo para comparar el mismo producto en varios sitios")
+    parser.add_argument("--variant", default=None, help="Talla JSON-LD a seguir si la URL tiene varias (ej: '240 x 220 cm')")
     args = parser.parse_args()
 
     try:
@@ -46,6 +48,7 @@ def main() -> int:
         currency=args.currency,
         active=True,
         grupo=args.grupo,
+        variant=args.variant,
     ))
     save_products(products)
     grupo_info = f" (grupo: {args.grupo})" if args.grupo else ""

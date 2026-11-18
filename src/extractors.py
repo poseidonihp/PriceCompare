@@ -263,8 +263,33 @@ def _variant_offer_candidates(product: dict, nodes: list[dict], page_url: str) -
     return candidates
 
 
-def _json_offer(soup: BeautifulSoup, page_url: str, expected_currency: str | None) -> ExtractedOffer:
+def _normalized_size(value: object) -> str:
+    return ' '.join(value.split()).casefold() if isinstance(value, str) else ''
+
+
+def _size_offer_candidates(nodes: list[dict], variant: str) -> list[ExtractedOffer]:
+    """Reúne ofertas de las entidades Product cuya talla coincide con la variante configurada.
+
+    Args:
+        nodes: Entidades estructuradas disponibles.
+        variant: Talla configurada, por ejemplo "240 x 220 cm".
+    Returns:
+        list[ExtractedOffer]
+    """
+    expected = _normalized_size(variant)
+    candidates: list[ExtractedOffer] = []
+    for product in _product_nodes(nodes):
+        if _normalized_size(product.get('size')) == expected:
+            candidates.extend(_offer_candidates(product, nodes))
+    return candidates
+
+
+def _json_offer(
+    soup: BeautifulSoup, page_url: str, expected_currency: str | None, variant: str | None = None,
+) -> ExtractedOffer:
     nodes = _json_nodes(soup)
+    if variant:
+        return _choose_offer(_compatible_offers(_size_offer_candidates(nodes, variant), expected_currency))
     product = _select_product(nodes, soup, page_url)
     if product is None:
         return ExtractedOffer()
@@ -484,7 +509,11 @@ def _mango_offer(soup: BeautifulSoup, page_url: str, selector: str | None) -> Ex
 
 
 def extract_offer(
-    html: str, selector: str | None = None, page_url: str = '', expected_currency: str | None = None,
+    html: str,
+    selector: str | None = None,
+    page_url: str = '',
+    expected_currency: str | None = None,
+    variant: str | None = None,
 ) -> ExtractedOffer:
     """Extrae una oferta coherente mediante reglas de tienda, selector, JSON-LD, metadatos o texto.
 
@@ -493,6 +522,7 @@ def extract_offer(
         selector: Selector opcional.
         page_url: URL consultada.
         expected_currency: Moneda configurada.
+        variant: Talla JSON-LD opcional; sin coincidencia no se usan metadatos ni texto.
     Returns:
         ExtractedOffer
     """
@@ -502,7 +532,7 @@ def extract_offer(
     mango = _mango_offer(soup, page_url, selector)
     if mango is not None:
         return mango
-    structured = _json_offer(soup, page_url, expected_currency)
+    structured = _json_offer(soup, page_url, expected_currency, variant)
     if selector:
         price = extract_from_selector(soup, selector)
         if price is not None:
@@ -513,6 +543,9 @@ def extract_offer(
         if structured.available is None:
             return ExtractedOffer(structured.price, _availability_from_page(_page_scope(soup)), structured.currency, jsonLdMethod)
         return structured
+    if variant:
+        # Metadatos y texto describen el producto completo, no la talla pedida
+        return ExtractedOffer()
     metadata = _meta_offer(soup)
     if metadata.price is not None:
         return metadata

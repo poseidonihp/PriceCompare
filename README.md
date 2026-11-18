@@ -70,6 +70,7 @@ Campos de cada producto:
 | `currency` | Moneda (USD, COP, etc.) solo para formato de display. |
 | `active` | `true` para que lo procese, `false` para pausarlo. |
 | `grupo` | Agrupa el mismo producto en varios sitios para comparación multi-sitio. |
+| `variant` | Opcional. Talla a seguir (`"240 x 220 cm"`) cuando la URL publica en JSON-LD un `Product` por talla; se compara con su campo `size`. |
 
 ### Correr manualmente
 

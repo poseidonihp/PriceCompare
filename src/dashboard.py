@@ -139,6 +139,8 @@ def api_products() -> JSONResponse:
                 "available": storage.last_availability(p.id),
                 "purchased": sp.purchased,
                 "purchased_at": sp.purchased_at,
+                # Un comprado no se consulta: su última captura envejece a propósito.
+                "is_stale": base["is_stale"] and not sp.purchased,
                 "history": [{"date": d[:10], "price": pr} for d, pr in history],
             })
     finally:
@@ -1019,7 +1021,7 @@ async function togglePurchased(productId) {
   const p = allProducts.find(x => x.id === productId);
   if (!p) return;
   const target = !p.purchased;
-  if (target && !confirm('¿Marcar "' + p.name + '" como comprado? Dejará de aparecer en reportes y notificaciones.')) return;
+  if (target && !confirm('¿Marcar "' + p.name + '" como comprado? Dejará de consultarse y de aparecer en reportes y notificaciones.')) return;
   try {
     const res = await fetch('/api/products/' + encodeURIComponent(productId) + '/purchased', {
       method: 'POST',
