@@ -185,6 +185,8 @@ Cascada de estrategias, en orden:
 
 Si HTTP simple no funciona (sitio con JavaScript), reintenta con **Playwright headless** y repite las 4 estrategias sobre el HTML renderizado.
 
+Algunas tiendas Shopify (por ejemplo Tayrona) publican el precio sin descuento y muestran la rebaja con el script `window.TDS` del tema. Si la página trae ese script con una regla vigente, el precio obtenido por JSON-LD, meta tags o regex se reemplaza por el precio rebajado de la variante seleccionada, y el método queda como `tds`. Un precio tomado del CSS selector custom no se modifica.
+
 Los precios ambiguos, no positivos o no finitos se descartan, incluso en la primera captura. Un selector CSS inválido se rechaza al guardar; si ya existe en el catálogo, solo falla ese producto. Las ofertas agotadas se guardan en el historial, pero no participan en la selección de la mejor oferta de un grupo. Los grupos tampoco repiten alertas por precios sin cambios.
 
 ## Notas

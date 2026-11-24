@@ -3,7 +3,8 @@ from __future__ import annotations
 import json
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from datetime import datetime, timezone
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlsplit, urlunsplit
 
 import soupsieve
@@ -21,6 +22,14 @@ ignoredSections = ('related', 'recommend', 'similar', 'recomend', 'relacionad', 
 hiddenStylePattern = re.compile(r'(?:^|;)\s*(?:display\s*:\s*none|visibility\s*:\s*hidden)\b', re.I)
 productType = 'Product'
 jsonLdMethod = 'json_ld'
+selectorMethod = 'selector'
+tdsMethod = 'tds'
+tdsScriptMarker = 'window.TDS'
+tdsRulesPattern = re.compile(r'\brules\s*:\s*(?=\[)')
+tdsProductPattern = re.compile(r'window\.TDS\.product\s*=\s*(?=\{)')
+tdsVariantFieldSelector = '.t4s-section-main-product form[data-type="add-to-cart-form"] [name="id"]'
+tdsTimezoneSuffix = '-05:00'
+tdsDateOnlyLength = 10  # longitud de "AAAA-MM-DD"; más larga incluye hora
 mangoAvailableSizePrefix = 'product.sizeSelector.available.'
 mangoUnavailableSizePrefix = 'product.sizeSelector.unavailable.'
 mangoCurrentPriceSelector = '[itemtype$="/Offer"]:has([class*="SinglePrice-"][class*="__finalPrice"]) [itemprop="price"]'
@@ -504,8 +513,188 @@ def _mango_offer(soup: BeautifulSoup, page_url: str, selector: str | None) -> Ex
     if selector:
         selected_price = extract_from_selector(soup, selector)
         if selected_price is not None:
-            price, method = selected_price, 'selector'
+            price, method = selected_price, selectorMethod
     return ExtractedOffer(price, _mango_availability(scope), currency, method)
+
+
+def _tds_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _decode_json_after(text: str, pattern: re.Pattern[str]) -> object:
+    """Decodifica el valor JSON que sigue al patrón dentro de un script.
+
+    Args:
+        text: Código del script.
+        pattern: Patrón que termina justo antes del valor.
+    Returns:
+        object
+    """
+    match = pattern.search(text)
+    if match is None:
+        return None
+    try:
+        return json.JSONDecoder().raw_decode(text, match.end())[0]
+    except (ValueError, RecursionError):
+        return None
+
+
+def _tds_data(soup: BeautifulSoup) -> tuple[list, dict] | None:
+    """Lee reglas y variantes del script de descuentos TDS publicado por el tema.
+
+    Args:
+        soup: Documento analizado.
+    Returns:
+        tuple[list, dict] | None
+    """
+    for script in soup.find_all('script'):
+        text = script.get_text()
+        if tdsScriptMarker not in text:
+            continue
+        rules = _decode_json_after(text, tdsRulesPattern)
+        product = _decode_json_after(text, tdsProductPattern)
+        if isinstance(rules, list) and isinstance(product, dict):
+            return rules, product
+    return None
+
+
+def _tds_bound(raw: object, end_of_day: bool) -> datetime | None:
+    """Interpreta un límite de regla TDS en hora -05:00, igual que el script.
+
+    Args:
+        raw: Fecha "AAAA-MM-DD" o "AAAA-MM-DD HH:MM"; vacía significa sin límite.
+        end_of_day: Completa una fecha sin hora con el final del día.
+    Returns:
+        datetime | None
+    """
+    raw = raw.strip() if isinstance(raw, str) else ''
+    if not raw:
+        return None
+    if len(raw) <= tdsDateOnlyLength:
+        iso = raw + ('T23:59:59' if end_of_day else 'T00:00:00')
+    else:
+        iso = raw.replace(' ', 'T') + ':00'
+    try:
+        return datetime.fromisoformat(iso + tdsTimezoneSuffix)
+    except ValueError:
+        return None
+
+
+def _tds_rule_active(rule: object, now: datetime) -> bool:
+    """Indica si la regla tiene porcentaje positivo y está dentro de sus fechas.
+
+    Args:
+        rule: Regla publicada por el script.
+        now: Momento de la consulta.
+    Returns:
+        bool
+    """
+    if not isinstance(rule, dict) or _positive_price(rule.get('pct')) is None:
+        return False
+    start = _tds_bound(rule.get('start'), end_of_day=False)
+    end = _tds_bound(rule.get('end'), end_of_day=True)
+    return (start is None or now >= start) and (end is None or now <= end)
+
+
+def _tds_rule_matches(rule: dict, product: dict, on_sale: bool) -> bool:
+    """Replica la elección del script por tienda completa, plantilla o colección.
+
+    Args:
+        rule: Regla vigente.
+        product: Plantilla "t" y colecciones "c" del producto.
+        on_sale: La variante ya tiene precio comparativo mayor.
+    Returns:
+        bool
+    """
+    if rule.get('skipSale') and on_sale:
+        return False
+    kind, template = rule.get('type'), product.get('t')
+    if kind == 'all':
+        return True
+    if kind == 'tpl':
+        return not template if rule.get('tpl') == 'default' else template == rule.get('tpl')
+    rule_collections, product_collections = rule.get('cols'), product.get('c')
+    if kind != 'col' or not isinstance(rule_collections, list) or not isinstance(product_collections, list):
+        return False
+    return any(handle in product_collections for handle in rule_collections)
+
+
+def _tds_selected_values(soup: BeautifulSoup, variants: dict) -> object:
+    """Obtiene los centavos de la variante elegida en el formulario de compra.
+
+    Args:
+        soup: Documento analizado.
+        variants: Centavos [precio, comparativo] por identificador de variante.
+    Returns:
+        object
+    """
+    field = soup.select_one(tdsVariantFieldSelector)
+    if field is None:
+        return next(iter(variants.values()), None)
+    if field.name == 'select':
+        field = field.select_one('option[selected]') or field.find('option')
+    return variants.get(str(field.get('value', ''))) if field is not None else None
+
+
+def _tds_variant_cents(soup: BeautifulSoup, product: dict) -> tuple[float, float] | None:
+    """Valida precio y comparativo en centavos de la variante elegida.
+
+    Args:
+        soup: Documento analizado.
+        product: Datos TDS del producto.
+    Returns:
+        tuple[float, float] | None
+    """
+    variants = product.get('v')
+    values = _tds_selected_values(soup, variants) if isinstance(variants, dict) else None
+    if not isinstance(values, list) or len(values) != 2:
+        return None
+    cents = _positive_price(values[0])
+    return (cents, _positive_price(values[1]) or 0.0) if cents is not None else None
+
+
+def _tds_discounted_price(soup: BeautifulSoup) -> float | None:
+    """Calcula el precio rebajado que el script TDS muestra para la variante elegida.
+
+    Args:
+        soup: Documento analizado.
+    Returns:
+        float | None
+    """
+    data = _tds_data(soup)
+    if data is None:
+        return None
+    rules, product = data
+    variant_cents = _tds_variant_cents(soup, product)
+    if variant_cents is None:
+        return None
+    cents, compare_cents = variant_cents
+    now = _tds_now()
+    matching = [
+        rule for rule in rules
+        if _tds_rule_active(rule, now) and _tds_rule_matches(rule, product, compare_cents > cents)
+    ]
+    best = max(matching, key=lambda rule: rule['pct'], default=None)
+    if best is None:
+        return None
+    # Math.round del script sube las mitades; round() de Python no
+    discounted_cents = math.floor(cents * (100 - best['pct']) / 100 + 0.5)
+    return _positive_price(discounted_cents / 100)
+
+
+def _apply_tds_discount(soup: BeautifulSoup, offer: ExtractedOffer) -> ExtractedOffer:
+    """Reemplaza el precio base por el descuento que la página calcula con JavaScript.
+
+    Args:
+        soup: Documento analizado.
+        offer: Oferta de la cascada estándar.
+    Returns:
+        ExtractedOffer
+    """
+    if offer.price is None or offer.method == selectorMethod:
+        return offer
+    price = _tds_discounted_price(soup)
+    return offer if price is None else replace(offer, price=price, method=tdsMethod)
 
 
 def extract_offer(
@@ -532,13 +721,34 @@ def extract_offer(
     mango = _mango_offer(soup, page_url, selector)
     if mango is not None:
         return mango
+    return _apply_tds_discount(soup, _standard_offer(soup, selector, page_url, expected_currency, variant))
+
+
+def _standard_offer(
+    soup: BeautifulSoup,
+    selector: str | None,
+    page_url: str,
+    expected_currency: str | None,
+    variant: str | None,
+) -> ExtractedOffer:
+    """Aplica selector, JSON-LD, metadatos y texto, en ese orden.
+
+    Args:
+        soup: Documento analizado.
+        selector: Selector opcional.
+        page_url: URL consultada.
+        expected_currency: Moneda configurada.
+        variant: Talla JSON-LD opcional; sin coincidencia no se usan metadatos ni texto.
+    Returns:
+        ExtractedOffer
+    """
     structured = _json_offer(soup, page_url, expected_currency, variant)
     if selector:
         price = extract_from_selector(soup, selector)
         if price is not None:
             if price == structured.price:
-                return ExtractedOffer(price, structured.available, structured.currency, 'selector')
-            return _fallback_offer(soup, price, 'selector', soup.select_one(selector))
+                return ExtractedOffer(price, structured.available, structured.currency, selectorMethod)
+            return _fallback_offer(soup, price, selectorMethod, soup.select_one(selector))
     if structured.price is not None:
         if structured.available is None:
             return ExtractedOffer(structured.price, _availability_from_page(_page_scope(soup)), structured.currency, jsonLdMethod)
