@@ -23,5 +23,13 @@
     "http_backoff_base_seconds": 1.0,
     "stealth_enabled": true,
     "max_workers": 4
+  },
+  "dashboard": {
+    "host": "127.0.0.1",
+    "port": 8000,
+    "username": "admin",
+    "password_hash": "",
+    "session_secret": "",
+    "session_days": 30
   }
 }

@@ -1,17 +1,21 @@
 """Dashboard web local para priceCompare.
 
-Lanzar con:  python -m src.dashboard
-Luego abrir: http://127.0.0.1:8000
+Lanzar con:  python -m src.dashboard   (antes: scripts/set_dashboard_password.py)
+Luego abrir: http://127.0.0.1:8000 (host y puerto en la sección `dashboard` de config.json)
 """
 from __future__ import annotations
 
+import hmac
 import json
+import logging
+import math
 from datetime import datetime, timedelta, timezone
+from logging.handlers import RotatingFileHandler
 from urllib.parse import urlsplit
 
 try:
-    from fastapi import FastAPI
-    from fastapi.responses import HTMLResponse, JSONResponse
+    from fastapi import FastAPI, Request
+    from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
     from pydantic import BaseModel
     import uvicorn
 except ImportError:
@@ -20,12 +24,50 @@ except ImportError:
         "  pip install fastapi uvicorn"
     )
 
-from .config import DB_PATH, Product, load_products, save_products
+from .auth import SECONDS_PER_DAY, LoginRateLimiter, create_session_token, read_session_token, verify_password
+from .config import (
+    DB_PATH, LOGS_DIR, DashboardConfig, Product, load_dashboard_config, load_products, save_products,
+)
 from .extractors import validate_selector
 from .storage import Storage
 
 app = FastAPI(title="priceCompare dashboard", docs_url=None, redoc_url=None)
+logger = logging.getLogger("priceCompare.dashboard")
 stalePriceHours = 48
+SESSION_COOKIE = "pc_session"
+LOGIN_PATH = "/login"
+PUBLIC_PATHS = frozenset({LOGIN_PATH, "/api/login", "/api/logout"})
+LOGIN_NOT_CONFIGURED = (
+    "Login sin configurar: ejecuta scripts/set_dashboard_password.py en el equipo del dashboard."
+)
+LOG_MAX_BYTES = 2_000_000
+LOG_BACKUP_COUNT = 5
+_login_limiter = LoginRateLimiter()
+
+
+def _auth_settings() -> DashboardConfig | None:
+    """Lee la sección `dashboard` en cada uso; None si config.json falta o es inválido."""
+    try:
+        return load_dashboard_config()
+    except (OSError, ValueError, TypeError) as exc:
+        logger.error("dashboard > _auth_settings - no se pudo leer config.json: %s", type(exc).__name__)
+        return None
+
+
+@app.middleware("http")
+async def _require_login(request: Request, call_next):
+    """Exige sesión válida salvo en login/logout; sin login configurado falla cerrado."""
+    if request.url.path in PUBLIC_PATHS:
+        return await call_next(request)
+    settings = _auth_settings()
+    if settings is None or not settings.configured:
+        return JSONResponse({"error": LOGIN_NOT_CONFIGURED}, status_code=503)
+    user = read_session_token(request.cookies.get(SESSION_COOKIE), settings.session_secret)
+    if user is not None and user == settings.username:
+        return await call_next(request)
+    if request.url.path.startswith("/api/"):
+        return JSONResponse({"error": "sesión requerida"}, status_code=401)
+    return RedirectResponse(LOGIN_PATH, status_code=303)
 
 
 def _valid_product_url(value: str) -> bool:
@@ -396,9 +438,131 @@ def api_estadisticas() -> JSONResponse:
     return JSONResponse({"top_bajadas_30d": bajadas[:5], "cerca_del_target": cerca[:5]})
 
 
+class LoginPayload(BaseModel):
+    username: str
+    password: str
+
+
+@app.post("/api/login")
+def api_login(payload: LoginPayload, request: Request) -> JSONResponse:
+    """Valida credenciales y emite la cookie de sesión; bloquea la IP tras fallos seguidos."""
+    settings = _auth_settings()
+    if settings is None or not settings.configured:
+        return JSONResponse({"error": LOGIN_NOT_CONFIGURED}, status_code=503)
+    # Detrás de cloudflared, uvicorn toma la IP real desde X-Forwarded-For.
+    client = request.client.host if request.client else "desconocido"
+    blocked = _login_limiter.blocked_seconds(client)
+    if blocked:
+        logger.warning("dashboard > api_login - IP bloqueada por intentos fallidos: %s", client)
+        minutes = math.ceil(blocked / 60)
+        return JSONResponse(
+            {"error": f"Demasiados intentos fallidos. Espera {minutes} minuto(s)."},
+            status_code=429, headers={"Retry-After": str(blocked)},
+        )
+    # Ambas comprobaciones siempre corren para no revelar cuál falló por el tiempo de respuesta.
+    valid_user = hmac.compare_digest(payload.username.encode("utf-8"), settings.username.encode("utf-8"))
+    valid_password = verify_password(payload.password, settings.password_hash)
+    if not (valid_user and valid_password):
+        _login_limiter.register_failure(client)
+        logger.warning("dashboard > api_login - intento de login fallido desde %s", client)
+        return JSONResponse({"error": "Usuario o contraseña incorrectos."}, status_code=401)
+    _login_limiter.reset(client)
+    response = JSONResponse({"ok": True})
+    response.set_cookie(
+        SESSION_COOKIE,
+        create_session_token(settings.username, settings.session_secret, settings.session_days),
+        max_age=settings.session_days * SECONDS_PER_DAY,
+        httponly=True,
+        # Cloudflare entrega X-Forwarded-Proto: https; en local por http la cookie no puede ser Secure.
+        secure=request.url.scheme == "https",
+        samesite="lax",
+        path="/",
+    )
+    return response
+
+
+@app.post("/api/logout")
+def api_logout() -> JSONResponse:
+    """Borra la cookie de sesión."""
+    response = JSONResponse({"ok": True})
+    response.delete_cookie(SESSION_COOKIE, path="/")
+    return response
+
+
+@app.get(LOGIN_PATH, response_class=HTMLResponse)
+def login_page() -> HTMLResponse:
+    return HTMLResponse(_LOGIN_HTML)
+
+
 @app.get("/", response_class=HTMLResponse)
 def dashboard() -> HTMLResponse:
     return HTMLResponse(_DASHBOARD_HTML)
+
+
+_LOGIN_HTML = """<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>priceCompare — Iniciar sesión</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: system-ui, -apple-system, sans-serif; background: #f1f5f9; color: #1e293b; min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 16px; }
+  .login-box { background: #fff; border-radius: 12px; box-shadow: 0 10px 40px rgba(0,0,0,.12); width: 100%; max-width: 360px; overflow: hidden; }
+  .login-head { background: linear-gradient(135deg,#1e40af,#2563eb); color: #fff; padding: 20px 24px; font-size: 20px; font-weight: 700; }
+  form { padding: 20px 24px 24px; }
+  label { display: block; font-size: 12px; color: #64748b; font-weight: 600; margin: 0 0 4px; }
+  input { width: 100%; border: 1.5px solid #cbd5e1; border-radius: 8px; padding: 9px 10px; font-size: 15px; outline: none; font-family: inherit; margin-bottom: 14px; }
+  input:focus { border-color: #2563eb; }
+  button { width: 100%; background: #2563eb; color: #fff; border: none; border-radius: 8px; padding: 10px; font-size: 15px; font-weight: 600; cursor: pointer; }
+  button:hover { background: #1e40af; }
+  button:disabled { opacity: .6; cursor: wait; }
+  #login-error { color: #dc2626; font-size: 13px; min-height: 18px; margin-bottom: 10px; }
+</style>
+</head>
+<body>
+<div class="login-box">
+  <div class="login-head">💰 priceCompare</div>
+  <form id="login-form">
+    <label for="username">Usuario</label>
+    <input id="username" name="username" autocomplete="username" required autofocus>
+    <label for="password">Contraseña</label>
+    <input id="password" name="password" type="password" autocomplete="current-password" required>
+    <div id="login-error" role="alert"></div>
+    <button type="submit" id="login-submit">Entrar</button>
+  </form>
+</div>
+<script>
+document.getElementById('login-form').addEventListener('submit', async event => {
+  event.preventDefault();
+  const message = document.getElementById('login-error');
+  const submit = document.getElementById('login-submit');
+  message.textContent = '';
+  submit.disabled = true;
+  try {
+    const response = await fetch('/api/login', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({
+        username: document.getElementById('username').value,
+        password: document.getElementById('password').value,
+      }),
+    });
+    if (response.ok) {
+      location.replace('/');
+      return;
+    }
+    const data = await response.json().catch(() => ({}));
+    message.textContent = data.error || 'No se pudo iniciar sesión.';
+  } catch (error) {
+    message.textContent = 'Error de red iniciando sesión.';
+  } finally {
+    submit.disabled = false;
+  }
+});
+</script>
+</body>
+</html>"""
 
 
 _DASHBOARD_HTML = """<!DOCTYPE html>
@@ -414,6 +578,8 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
   header { background: linear-gradient(135deg,#1e40af,#2563eb); color: #fff; padding: 20px 32px; display: flex; align-items: center; gap: 12px; }
   header h1 { font-size: 22px; font-weight: 700; }
   header span { font-size: 13px; opacity: .75; margin-left: auto; }
+  .logout-btn { background: rgba(255,255,255,.15); color: #fff; border: 1px solid rgba(255,255,255,.45); border-radius: 8px; padding: 5px 12px; font-size: 13px; cursor: pointer; font-family: inherit; white-space: nowrap; }
+  .logout-btn:hover { background: rgba(255,255,255,.28); }
   #summary { display: flex; gap: 16px; padding: 24px 32px 8px; flex-wrap: wrap; }
   .stat { background: #fff; border-radius: 10px; padding: 16px 24px; min-width: 140px; box-shadow: 0 1px 4px rgba(0,0,0,.07); }
   .stat .val { font-size: 28px; font-weight: 700; color: #2563eb; }
@@ -502,6 +668,7 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
   <span style="font-size:22px">💰</span>
   <h1>priceCompare</h1>
   <span id="last-update"></span>
+  <button id="btn-logout" class="logout-btn" type="button">Cerrar sesión</button>
 </header>
 <div id="summary">
   <div class="stat"><div class="val" id="s-total">—</div><div class="lbl">productos</div></div>
@@ -594,6 +761,33 @@ let activeFilter = 'all';
 const _formatters = Object.create(null);
 const captureStatusLabels = {success: 'Captura exitosa', error: 'Falló la consulta', rejected: 'Precio rechazado'};
 const chartIds = new Map();
+
+/**
+ * Llama a la API y lleva al login cuando la sesión venció.
+ * @param {string} url Ruta de la API.
+ * @param {RequestInit} [options] Opciones de fetch.
+ * @returns {Promise<Response>} Nunca se resuelve si redirige, así no aparecen alertas de error.
+ */
+async function apiFetch(url, options) {
+  const response = await fetch(url, options);
+  if (response.status !== 401) return response;
+  location.href = '/login';
+  return new Promise(() => {});
+}
+
+/**
+ * Cierra la sesión y vuelve a la pantalla de login.
+ * @returns {Promise<void>}
+ */
+async function logout() {
+  try {
+    await fetch('/api/logout', {method: 'POST'});
+  } catch (e) {
+    alert('Error de red cerrando sesión.');
+    return;
+  }
+  location.href = '/login';
+}
 
 /**
  * Escapa contenido dinámico antes de insertarlo en HTML o atributos.
@@ -813,7 +1007,7 @@ function applyFilters() {
 
 async function load() {
   try {
-    const res = await fetch('/api/products');
+    const res = await apiFetch('/api/products');
     allProducts = await res.json();
   } catch(e) {
     document.getElementById('grid').innerHTML = '<div class="empty">Error cargando datos.</div>';
@@ -857,7 +1051,7 @@ async function load() {
 async function loadTendencias() {
   const cont = document.getElementById('tendencias');
   try {
-    const res = await fetch('/api/estadisticas');
+    const res = await apiFetch('/api/estadisticas');
     if (!res.ok) throw new Error('error');
     const d = await res.json();
     let html = '';
@@ -887,7 +1081,7 @@ async function loadTendencias() {
 async function loadHuerfanos() {
   const cont = document.getElementById('huerfanos');
   try {
-    const res = await fetch('/api/huerfanos');
+    const res = await apiFetch('/api/huerfanos');
     if (!res.ok) throw new Error('error');
     const items = await res.json();
     if (!items.length) { cont.style.display = 'none'; return; }
@@ -906,7 +1100,7 @@ async function loadHuerfanos() {
 async function purgarHuerfano(id) {
   if (!confirm('¿Borrar definitivamente este producto y todo su historial de la base de datos?')) return;
   try {
-    const res = await fetch('/api/huerfanos/' + encodeURIComponent(id), {method: 'DELETE'});
+    const res = await apiFetch('/api/huerfanos/' + encodeURIComponent(id), {method: 'DELETE'});
     if (!res.ok) throw new Error('error');
     loadHuerfanos();
   } catch (e) {
@@ -957,7 +1151,7 @@ async function submitForm(ev) {
     body.id = document.getElementById('f-id').value.trim();
   }
   try {
-    const res = await fetch(url, {
+    const res = await apiFetch(url, {
       method,
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(body),
@@ -978,7 +1172,7 @@ async function toggleActive(id) {
   const p = allProducts.find(x => x.id === id);
   if (!p) return;
   try {
-    const res = await fetch('/api/products/' + encodeURIComponent(id) + '/active', {
+    const res = await apiFetch('/api/products/' + encodeURIComponent(id) + '/active', {
       method: 'PATCH',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({active: !p.active}),
@@ -999,7 +1193,7 @@ async function deleteProduct(id) {
     purgar = confirm('¿Borrar también su historial de precios de la base de datos? — Aceptar: borrar historial · Cancelar: conservarlo (quedará como huérfano purgable)');
   }
   try {
-    const res = await fetch('/api/products/' + encodeURIComponent(id) + '?purgar_historial=' + purgar, {method: 'DELETE'});
+    const res = await apiFetch('/api/products/' + encodeURIComponent(id) + '?purgar_historial=' + purgar, {method: 'DELETE'});
     if (!res.ok) throw new Error('error');
     load();
   } catch (e) {
@@ -1016,6 +1210,7 @@ document.querySelectorAll('.pill[data-f]').forEach(btn => {
   });
 });
 document.getElementById('search').addEventListener('input', applyFilters);
+document.getElementById('btn-logout').addEventListener('click', logout);
 
 async function togglePurchased(productId) {
   const p = allProducts.find(x => x.id === productId);
@@ -1023,7 +1218,7 @@ async function togglePurchased(productId) {
   const target = !p.purchased;
   if (target && !confirm('¿Marcar "' + p.name + '" como comprado? Dejará de consultarse y de aparecer en reportes y notificaciones.')) return;
   try {
-    const res = await fetch('/api/products/' + encodeURIComponent(productId) + '/purchased', {
+    const res = await apiFetch('/api/products/' + encodeURIComponent(productId) + '/purchased', {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
       body: JSON.stringify({purchased: target}),
@@ -1049,7 +1244,7 @@ async function openHistory(productId) {
   body.innerHTML = '<div class="modal-empty">Cargando…</div>';
   modal.classList.add('open');
   try {
-    const res = await fetch('/api/products/' + encodeURIComponent(productId) + '/changes');
+    const res = await apiFetch('/api/products/' + encodeURIComponent(productId) + '/changes');
     if (!res.ok) throw new Error('error');
     const data = await res.json();
     if (!data.changes || data.changes.length === 0) {
@@ -1104,5 +1299,32 @@ load();
 </html>"""
 
 
+def _configure_logging() -> None:
+    """Envía los logs del dashboard y de uvicorn a logs/dashboard.log y a la consola."""
+    LOGS_DIR.mkdir(parents=True, exist_ok=True)
+    formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    file_handler = RotatingFileHandler(
+        LOGS_DIR / "dashboard.log", maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUP_COUNT, encoding="utf-8",
+    )
+    file_handler.setFormatter(formatter)
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(formatter)
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    root.handlers = [file_handler, stream_handler]
+
+
+def _run() -> None:
+    """Arranca uvicorn con host y puerto de config.json; sin login configurado no arranca."""
+    _configure_logging()
+    settings = _auth_settings()
+    if settings is None or not settings.configured:
+        logger.error("dashboard > _run - %s", LOGIN_NOT_CONFIGURED)
+        raise SystemExit(1)
+    logger.info("dashboard > _run - escuchando en http://%s:%s", settings.host, settings.port)
+    # log_config=None: uvicorn no reemplaza los handlers y sus logs llegan a dashboard.log.
+    uvicorn.run("src.dashboard:app", host=settings.host, port=settings.port, reload=False, log_config=None)
+
+
 if __name__ == "__main__":
-    uvicorn.run("src.dashboard:app", host="127.0.0.1", port=8000, reload=False)
+    _run()

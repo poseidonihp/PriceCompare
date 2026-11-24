@@ -89,6 +89,23 @@ class ScraperConfig:
 
 
 @dataclass
+class DashboardConfig:
+    host: str = "127.0.0.1"
+    port: int = 8000
+    username: str = "admin"
+    # Hash scrypt generado por scripts/set_dashboard_password.py; vacío = login sin configurar
+    password_hash: str = ""
+    # Clave HMAC de la cookie de sesión; cambiarla invalida las sesiones abiertas
+    session_secret: str = ""
+    session_days: int = 30
+
+    @property
+    def configured(self) -> bool:
+        """Indica si hay contraseña y clave de sesión para habilitar el login."""
+        return bool(self.password_hash and self.session_secret)
+
+
+@dataclass
 class Config:
     telegram: TelegramConfig
     email: EmailConfig
@@ -119,6 +136,42 @@ def load_config() -> Config:
             max_workers=s.get("max_workers", 4),
         ),
     )
+
+
+def _read_config_json() -> dict:
+    """Lee config.json completo como dict; falla con un mensaje guía si no existe."""
+    if not CONFIG_PATH.exists():
+        raise FileNotFoundError(
+            f"No existe {CONFIG_PATH}. Copia config.example.json a config.json y completa los valores."
+        )
+    with CONFIG_PATH.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def load_dashboard_config() -> DashboardConfig:
+    """Lee solo la sección `dashboard` de config.json; las claves ausentes usan su valor por defecto."""
+    d = _read_config_json().get("dashboard") or {}
+    defaults = DashboardConfig()
+    return DashboardConfig(
+        host=d.get("host", defaults.host),
+        port=int(d.get("port", defaults.port)),
+        username=d.get("username", defaults.username),
+        password_hash=d.get("password_hash", defaults.password_hash),
+        session_secret=d.get("session_secret", defaults.session_secret),
+        session_days=int(d.get("session_days", defaults.session_days)),
+    )
+
+
+def save_dashboard_credentials(username: str, password_hash: str, session_secret: str) -> None:
+    """Guarda usuario, hash y clave de sesión en config.json sin tocar las otras secciones."""
+    raw = _read_config_json()
+    section = raw.setdefault("dashboard", {})
+    section.update(username=username, password_hash=password_hash, session_secret=session_secret)
+    # Escritura atómica: config.json tiene secretos y no debe quedar a medias.
+    tmp_path = CONFIG_PATH.with_suffix(".json.tmp")
+    with tmp_path.open("w", encoding="utf-8") as f:
+        json.dump(raw, f, indent=2, ensure_ascii=False)
+    os.replace(tmp_path, CONFIG_PATH)
 
 
 def load_products() -> list[Product]:

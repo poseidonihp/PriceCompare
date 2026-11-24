@@ -8,7 +8,7 @@ from urllib.parse import urlsplit
 
 from playwright.sync_api import Route, sync_playwright
 
-from src.dashboard import _DASHBOARD_HTML
+from src.dashboard import _DASHBOARD_HTML, _LOGIN_HTML
 
 
 class DashboardBrowserTests(unittest.TestCase):
@@ -44,6 +44,9 @@ class DashboardBrowserTests(unittest.TestCase):
         self._requests.append((route.request.method, path))
         if path == '/':
             route.fulfill(content_type='text/html', body=_DASHBOARD_HTML)
+            return
+        if path == '/login':
+            route.fulfill(content_type='text/html', body=_LOGIN_HTML)
             return
         if path.endswith('.js'):
             route.fulfill(content_type='application/javascript', body='window.Chart = class { destroy() {} };')
@@ -92,6 +95,35 @@ class DashboardBrowserTests(unittest.TestCase):
         self._page.wait_for_function('document.querySelector(".card") !== null')
         self.assertTrue(any(method == 'PATCH' and path.endswith('/active') for method, path in self._requests))
         self.assertEqual(self._errors, [])
+
+    def test_logout_clears_session_and_shows_login(self) -> None:
+        self._page.locator('#btn-logout').click()
+        self._page.wait_for_url('**/login')
+        self._page.locator('#login-form').wait_for()
+        self.assertIn(('POST', '/api/logout'), self._requests)
+        self.assertEqual(self._errors, [])
+
+    def test_expired_session_redirects_to_login_without_alerts(self) -> None:
+        page = self._browser.new_page()
+        dialogs: list[str] = []
+        page.on('dialog', lambda dialog: (dialogs.append(dialog.message), dialog.dismiss()))
+
+        def respond_expired(route: Route) -> None:
+            path = urlsplit(route.request.url).path
+            if path == '/':
+                route.fulfill(content_type='text/html', body=_DASHBOARD_HTML)
+            elif path == '/login':
+                route.fulfill(content_type='text/html', body=_LOGIN_HTML)
+            elif path.endswith('.js'):
+                route.fulfill(content_type='application/javascript', body='window.Chart = class { destroy() {} };')
+            else:
+                route.fulfill(status=401, content_type='application/json', body='{"error": "sesión requerida"}')
+
+        page.route('**/*', respond_expired)
+        page.goto('http://dashboard.test/')
+        page.wait_for_url('**/login')
+        page.locator('#login-form').wait_for()
+        self.assertEqual(dialogs, [])
 
 
 if __name__ == '__main__':

@@ -99,10 +99,11 @@ La **primera corrida** de un producto solo guarda el precio inicial, no notifica
 Ver historial de precios, estado de stock y comparativas en el navegador:
 
 ```powershell
-python -m src.dashboard
+.venv\Scripts\python.exe scripts\set_dashboard_password.py   # una sola vez: usuario y contraseña
+.venv\Scripts\python.exe -m src.dashboard
 ```
 
-Luego abrí `http://127.0.0.1:8000`. Muestra todos los productos con gráfico de evolución, badges de estado (bajada, objetivo alcanzado, sin stock, mínimo histórico) y filtros. Requiere `fastapi` y `uvicorn` (incluidos en `requirements.txt`).
+Luego abrí `http://127.0.0.1:8000` e iniciá sesión. Sin contraseña configurada el dashboard no arranca. Para dejarlo siempre activo y accesible desde afuera, ver [Desplegar el dashboard en el mini PC](#desplegar-el-dashboard-en-el-mini-pc). Muestra todos los productos con gráfico de evolución, badges de estado (bajada, objetivo alcanzado, sin stock, mínimo histórico) y filtros. Requiere `fastapi` y `uvicorn` (incluidos en `requirements.txt`).
 
 Cada tarjeta muestra la última captura exitosa, el último intento y su resultado. Un precio sin captura exitosa durante más de 48 horas aparece como **desactualizado**. Los fallos de consulta y los precios rechazados conservan el último precio aceptado y muestran el motivo. La hora del encabezado corresponde a una captura real.
 
@@ -155,6 +156,74 @@ Start-ScheduledTask -TaskName "priceCompare"    # Forzar corrida ahora
 Unregister-ScheduledTask -TaskName "priceCompare" -Confirm:$false  # Eliminar
 ```
 
+Si el equipo estaba apagado a la hora programada, la tarea corre apenas enciende.
+
+### Desplegar el dashboard en el mini PC
+
+El dashboard queda siempre activo: arranca con Windows aunque nadie inicie sesión. Se publica en un subdominio de Cloudflare protegido en dos capas: Cloudflare Access y el login propio del dashboard. Los ejemplos asumen el proyecto en `C:\priceCompare`.
+
+**1. Login del dashboard.** Se configura una vez. Para cambiar la contraseña se repite el comando, y eso cierra las sesiones abiertas.
+
+```powershell
+cd C:\priceCompare
+.venv\Scripts\python.exe scripts\set_dashboard_password.py
+```
+
+En la sección `dashboard` de `config.json` se guardan solo el hash scrypt de la contraseña y una clave de sesión aleatoria. Ahí también se ajustan:
+
+- `host` y `port`: por defecto `127.0.0.1:8000`. Cambiá el puerto si otro proyecto lo usa.
+- `session_days`: por defecto `30`.
+
+Tras 5 intentos fallidos seguidos, la IP queda bloqueada 15 minutos.
+
+**2. Tarea que arranca con el equipo.** Primero cerrá el dashboard si lo tenías abierto a mano, para liberar el puerto. Después, en PowerShell **como administrador**:
+
+```powershell
+cd C:\priceCompare
+powershell -ExecutionPolicy Bypass -File scripts\install_dashboard_task.ps1
+```
+
+Esto crea la tarea `priceCompare-dashboard`, que:
+
+- arranca con Windows usando tu usuario, sin necesidad de iniciar sesión;
+- se revisa cada 5 minutos y relanza el proceso si se cayó;
+- no tiene límite de duración;
+- escribe los logs en `logs\dashboard.log`.
+
+```powershell
+Get-ScheduledTask -TaskName "priceCompare-dashboard"     # Ver estado
+Stop-ScheduledTask -TaskName "priceCompare-dashboard"    # Detener (la revisión la relanza en ≤5 min)
+Start-ScheduledTask -TaskName "priceCompare-dashboard"   # Iniciar
+Disable-ScheduledTask -TaskName "priceCompare-dashboard" # Desactivar del todo
+Unregister-ScheduledTask -TaskName "priceCompare-dashboard" -Confirm:$false  # Eliminar
+```
+
+Después de actualizar el código, reiniciá la tarea con `Stop-ScheduledTask` y luego `Start-ScheduledTask`.
+
+**3. Publicarlo en el túnel de Cloudflare**, en un subdominio como `precios.tudominio.com`:
+
+- **Túnel administrado desde el panel** (instalado con `cloudflared service install <token>`): andá a Zero Trust → Networks → Tunnels → tu túnel → *Public Hostname*. En el panel nuevo esa opción se llama *Published application routes*. Agregá una ruta con subdominio `precios`, tu dominio, tipo `HTTP` y URL `localhost:8000`. Cloudflare crea el registro DNS solo.
+- **Túnel local con `config.yml`**: en el `config.yml` que usa tu servicio de `cloudflared`, agregá esta regla antes de la regla final `- service: http_status:404`:
+
+  ```yaml
+  - hostname: precios.tudominio.com
+    service: http://localhost:8000
+  ```
+
+  Después corré `cloudflared tunnel route dns <nombre-del-tunel> precios.tudominio.com` y `Restart-Service cloudflared`.
+
+El dashboard solo escucha en `127.0.0.1`, así que desde la red solo se llega a él a través del túnel. Detrás de Cloudflare, la cookie de sesión se marca `Secure` y el límite de intentos usa la IP real del visitante.
+
+**4. Cloudflare Access (primera capa).** Andá a Zero Trust → Access → Applications → *Add an application* → *Self-hosted*:
+
+- Dominio `precios.tudominio.com` y *Session Duration* `1 month`.
+- Política con acción `Allow`, e *Include* → *Emails* con tu correo.
+- Método de login: *One-time PIN* (código al correo) o Google.
+
+Así nadie más llega siquiera al mini PC, y el login del dashboard queda como segunda capa. Si la sesión de Access vence con el dashboard abierto, las acciones fallan: recargá la página para volver a pasar por Access.
+
+**5. Comprobar desde afuera.** Desde el celular con datos móviles, abrí `https://precios.tudominio.com`. Debe pedir Access y después el login del dashboard. Editá un producto y usá *Cerrar sesión*: la siguiente carga tiene que volver al login.
+
 ## Estructura de archivos
 
 ```
@@ -167,9 +236,12 @@ priceCompare/
 ├── data/html_cache/           # Caché HTML opcional (--cache-html)
 ├── reports/YYYY-MM-DD.md      # Reporte solo si hubo bajadas/novedades
 ├── logs/run.log               # Log rotado de cada corrida
+├── logs/dashboard.log         # Log rotado del dashboard
 ├── src/                       # Código
-│   └── dashboard.py           # Dashboard web (python -m src.dashboard)
-└── scripts/                   # Helpers (add_product, install_task, minimo_producto)
+│   ├── dashboard.py           # Dashboard web (python -m src.dashboard)
+│   └── auth.py                # Login del dashboard: hash, cookie firmada, límite de intentos
+└── scripts/                   # Helpers (add_product, install_task, install_dashboard_task,
+                               #          set_dashboard_password, minimo_producto)
 ```
 
 `data/`, `reports/` y `logs/` se crean solos en la primera corrida y no se versionan.

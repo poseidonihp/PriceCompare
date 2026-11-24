@@ -23,8 +23,13 @@ python -m src.main --dry-run                # consulta precios, no guarda ni not
 python -m src.main --product lg-c5-55       # solo un producto (por id de products.json)
 python -m src.main --cache-html             # lee/escribe HTML en data/html_cache/ para iterar selectores
 
-# Dashboard web (FastAPI + uvicorn) → http://127.0.0.1:8000
-python -m src.dashboard
+# Dashboard web (FastAPI + uvicorn) → http://127.0.0.1:8000 (host/puerto en config.json "dashboard")
+python scripts/set_dashboard_password.py    # una vez: usuario + hash scrypt + clave de sesión en config.json
+python -m src.dashboard                     # sin login configurado sale con código 1
+
+# Dashboard siempre activo en el mini PC: tarea al iniciar Windows (PowerShell como administrador)
+powershell -ExecutionPolicy Bypass -File scripts\install_dashboard_task.ps1
+Unregister-ScheduledTask -TaskName "priceCompare-dashboard" -Confirm:$false
 
 # Helpers
 python scripts/add_product.py <id> "<nombre>" "<url>" [--selector CSS] [--target 800] [--currency USD] [--grupo ID]
@@ -53,7 +58,8 @@ Módulos:
 4. **[storage.py](src/storage.py)** — SQLite con `products` (metadata + `initial_price`/`initial_date` inmutables + `purchased`) y `price_history` (append-only, con `available`). Las columnas nuevas se agregan en `_migrate` con `ALTER TABLE` condicional: **toda columna nueva debe sumarse ahí además de en `SCHEMA`**, o las BD existentes se rompen.
 5. **[reporter.py](src/reporter.py)** — tres salidas desde los mismos dataclasses (`PriceDrop`, `PriceDropGrupo`, `RestockAlert`): Markdown persistente, texto plano para Telegram y HTML para email (con sparkline PNG en base64 generado por matplotlib; si matplotlib falla, se omite silenciosamente).
 6. **[notifier.py](src/notifier.py)** — Telegram vía `api.telegram.org` y email SMTP con `starttls` + app password. Ambos respetan `enabled` y nunca propagan excepciones (loguean y retornan `False`).
-7. **[dashboard.py](src/dashboard.py)** — FastAPI de un solo archivo (HTML/CSS/JS inline en `_DASHBOARD_HTML`, Chart.js por CDN). CRUD de productos, toggle activo/comprado, histórico compacto, estadísticas y purga de huérfanos.
+7. **[dashboard.py](src/dashboard.py)** — FastAPI de un solo archivo (HTML/CSS/JS inline en `_DASHBOARD_HTML` y `_LOGIN_HTML`, Chart.js por CDN). CRUD de productos, toggle activo/comprado, histórico compacto, estadísticas y purga de huérfanos. El middleware `_require_login` protege todo salvo `/login`, `/api/login` y `/api/logout`: `/api/*` sin sesión → 401 (el JS redirige vía `apiFetch`), el resto → 303 a `/login`. Sin `password_hash`/`session_secret` en config.json **falla cerrado** con 503. Lee la sección `dashboard` en cada request, así que un cambio de contraseña aplica sin reiniciar. Toda llamada nueva del JS a la API debe usar `apiFetch`, no `fetch`.
+8. **[auth.py](src/auth.py)** — solo stdlib: hash scrypt, cookie `pc_session` firmada con HMAC (usuario + vencimiento) y `LoginRateLimiter` por IP (5 fallos → 15 min). Detrás de cloudflared, uvicorn toma IP y esquema de `X-Forwarded-*` (confía solo en 127.0.0.1), así que la cookie es `Secure` por https y no por http local.
 
 ### Reglas de notificación
 
