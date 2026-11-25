@@ -15,7 +15,7 @@ from urllib.parse import urlsplit
 
 try:
     from fastapi import FastAPI, Request
-    from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+    from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
     from pydantic import BaseModel
     import uvicorn
 except ImportError:
@@ -36,7 +36,8 @@ logger = logging.getLogger("priceCompare.dashboard")
 stalePriceHours = 48
 SESSION_COOKIE = "pc_session"
 LOGIN_PATH = "/login"
-PUBLIC_PATHS = frozenset({LOGIN_PATH, "/api/login", "/api/logout"})
+FAVICON_PATH = "/favicon.svg"
+PUBLIC_PATHS = frozenset({LOGIN_PATH, FAVICON_PATH, "/api/login", "/api/logout"})
 LOGIN_NOT_CONFIGURED = (
     "Login sin configurar: ejecuta scripts/set_dashboard_password.py en el equipo del dashboard."
 )
@@ -499,12 +500,34 @@ def dashboard() -> HTMLResponse:
     return HTMLResponse(_DASHBOARD_HTML)
 
 
+@app.get(FAVICON_PATH)
+def favicon() -> Response:
+    """Ícono de la pestaña; es público para que también aparezca en el login."""
+    return Response(_FAVICON_SVG, media_type="image/svg+xml")
+
+
+# Etiqueta de precio con "$" en el degradado azul del header.
+_FAVICON_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">'
+    '<defs><linearGradient id="g" x1="0" y1="0" x2="1" y2="1">'
+    '<stop offset="0" stop-color="#2563eb"/><stop offset="1" stop-color="#1e40af"/>'
+    '</linearGradient></defs>'
+    '<g transform="translate(32 32) scale(1.15) translate(-33 -33)">'
+    '<path transform="translate(-5 -5) rotate(45 32 32)" fill="url(#g)" fill-rule="evenodd" '
+    'd="M6 32L22 14H54a4 4 0 0 1 4 4V46a4 4 0 0 1-4 4H22ZM14 32a4 4 0 1 0 8 0a4 4 0 1 0-8 0Z"/>'
+    '<text x="33" y="34" fill="#fff" font-family="Arial,Helvetica,sans-serif" font-size="28" '
+    'font-weight="700" text-anchor="middle" dominant-baseline="central">$</text>'
+    '</g></svg>'
+)
+
+
 _LOGIN_HTML = """<!DOCTYPE html>
 <html lang="es">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>priceCompare — Iniciar sesión</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: system-ui, -apple-system, sans-serif; background: #f1f5f9; color: #1e293b; min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 16px; }
@@ -571,6 +594,7 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>priceCompare — Dashboard</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
 <style>
   *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -634,6 +658,7 @@ _DASHBOARD_HTML = """<!DOCTYPE html>
   .modal-body td.delta { text-align: right; font-size: 12px; font-weight: 600; font-family: ui-monospace, monospace; }
   .modal-body td.delta.down { color: #16a34a; }
   .modal-body td.delta.up   { color: #dc2626; }
+  .modal-body td .badge-min { margin-left: 8px; white-space: nowrap; }
   .modal-body .modal-empty { text-align: center; color: #94a3b8; padding: 30px 10px; }
   .form-row { margin-bottom: 12px; }
   .form-row label { display: block; font-size: 12px; color: #64748b; font-weight: 600; margin-bottom: 4px; }
@@ -760,6 +785,7 @@ let activeFilter = 'all';
 
 const _formatters = Object.create(null);
 const captureStatusLabels = {success: 'Captura exitosa', error: 'Falló la consulta', rejected: 'Precio rechazado'};
+const minBadgeHtml = '<span class="badge badge-min">🏆 Mínimo histórico</span>';
 const chartIds = new Map();
 
 /**
@@ -880,7 +906,7 @@ function buildCard(p) {
   if (isDown) badges += `<span class="badge badge-drop">▼ ${Math.abs(diff)}%</span>`;
   if (isUp)   badges += `<span class="badge badge-up">▲ ${diff}%</span>`;
   if (hitTarget) badges += '<span class="badge badge-hit">✅ Objetivo</span>';
-  if (isMin)  badges += '<span class="badge badge-min">🏆 Mínimo histórico</span>';
+  if (isMin)  badges += minBadgeHtml;
 
   const pctClass = isDown ? 'down' : isUp ? 'up' : '';
   const pctStr = diff !== null ? `${parseFloat(diff) > 0 ? '+' : ''}${diff}%` : '';
@@ -1251,19 +1277,23 @@ async function openHistory(productId) {
       body.innerHTML = '<div class="modal-empty">Sin datos.</div>';
       return;
     }
-    const rows = data.changes.map((c, i) => {
-      const prev = i > 0 ? data.changes[i-1].price : null;
+    const prices = data.changes.map(change => change.price);
+    // Ante empates se marca la fecha más reciente, igual que storage.min_price.
+    const minIndex = prices.lastIndexOf(Math.min(...prices));
+    const rows = data.changes.map((change, index) => {
+      const prev = index > 0 ? data.changes[index-1].price : null;
       let delta = '';
       if (prev != null) {
-        const diff = c.price - prev;
+        const diff = change.price - prev;
         const cls  = diff < 0 ? 'down' : 'up';
         const sign = diff > 0 ? '+' : '';
         delta = `<td class="delta ${cls}">${sign}${fmtNum(diff, data.currency)}</td>`;
       } else {
         delta = '<td class="delta">—</td>';
       }
-      const date = c.date.slice(0,10).split('-').reverse().join('/');
-      return `<tr><td>${escapeHtml(date)}</td><td class="price">${fmt(c.price, data.currency)}</td>${delta}</tr>`;
+      const date = change.date.slice(0,10).split('-').reverse().join('/');
+      const minBadge = index === minIndex ? minBadgeHtml : '';
+      return `<tr><td>${escapeHtml(date)}${minBadge}</td><td class="price">${fmt(change.price, data.currency)}</td>${delta}</tr>`;
     }).join('');
     body.innerHTML = `<table>
       <thead><tr><th>Fecha</th><th style="text-align:right">Precio</th><th style="text-align:right">Δ</th></tr></thead>

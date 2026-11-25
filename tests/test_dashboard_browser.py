@@ -60,7 +60,11 @@ class DashboardBrowserTests(unittest.TestCase):
             '/api/huerfanos': [{'id': 'orphan', 'name': self._name, 'registros': 1, 'ultima_captura': '2020-01-01'}],
         }
         if path.endswith('/changes'):
-            payload = {'currency': 'COP', 'changes': [{'date': '2020-01-01', 'price': 100}, {'date': '2020-01-02', 'price': 90}]}
+            payload = {'currency': 'COP', 'changes': [
+                {'date': '2020-01-01', 'price': 100}, {'date': '2020-01-02', 'price': 80},
+                {'date': '2020-01-03', 'price': 95}, {'date': '2020-01-04', 'price': 80},
+                {'date': '2020-01-05', 'price': 90},
+            ]}
         else:
             payload = responses.get(path, {})
         route.fulfill(content_type='application/json', body=json.dumps(payload))
@@ -94,6 +98,15 @@ class DashboardBrowserTests(unittest.TestCase):
         self._page.locator('.card [data-action="active"]').click()
         self._page.wait_for_function('document.querySelector(".card") !== null')
         self.assertTrue(any(method == 'PATCH' and path.endswith('/active') for method, path in self._requests))
+        self.assertEqual(self._errors, [])
+
+    def test_history_marks_latest_minimum_price_row(self) -> None:
+        self._page.locator('.card [data-action="history"]').click()
+        self._page.locator('#modal-body table').wait_for()
+        marked_rows = self._page.locator('#modal-body tbody tr').filter(has=self._page.locator('.badge-min'))
+        self.assertEqual(marked_rows.count(), 1)
+        self.assertIn('04/01/2020', marked_rows.inner_text())
+        self.assertIn('Mínimo histórico', marked_rows.inner_text())
         self.assertEqual(self._errors, [])
 
     def test_logout_clears_session_and_shows_login(self) -> None:
